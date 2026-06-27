@@ -33,11 +33,198 @@
 #endif
 
 AsyncWebServer server(80);
+AsyncWebServer apiServer(8080);
 AsyncWebSocket ws("/ws");
 WifiManager wm;
 
 SemaphoreHandle_t wsMutex;
 uint32_t lastssidscan = 0;
+uint32_t lastPriceApiRequest = 0;
+
+static void sendApiJson(AsyncWebServerRequest *request, int status, const JsonDocument &doc) {
+    AsyncResponseStream *response = request->beginResponseStream("application/json");
+    response->setCode(status);
+    serializeJson(doc, *response);
+    request->send(response);
+}
+
+static bool priceApiAuthorized(AsyncWebServerRequest *request) {
+    if (config.apiToken.length() < 24 || !request->hasHeader("Authorization")) return false;
+
+    const String supplied = request->getHeader("Authorization")->value();
+    const String expected = "Bearer " + config.apiToken;
+    if (supplied.length() != expected.length()) return false;
+
+    uint8_t difference = 0;
+    for (size_t i = 0; i < supplied.length(); i++) {
+        difference |= supplied[i] ^ expected[i];
+    }
+    return difference == 0;
+}
+
+static bool validPriceApiText(const String &value, size_t maxLength) {
+    return value.length() > 0 && value.length() <= maxLength;
+}
+
+static void initPriceApi() {
+    apiServer.on("/health", HTTP_GET, [](AsyncWebServerRequest *request) {
+        JsonDocument response;
+        if (!priceApiAuthorized(request)) {
+            response["ok"] = false;
+            response["error"] = "unauthorized";
+            sendApiJson(request, 401, response);
+            return;
+        }
+        response["ok"] = apInfo.state == AP_STATE_ONLINE;
+        response["apstate"] = apInfo.state;
+        response["api"] = "price-v1";
+        sendApiJson(request, 200, response);
+    });
+
+    AsyncCallbackJsonWebHandler *priceHandler = new AsyncCallbackJsonWebHandler("/price", [](AsyncWebServerRequest *request, JsonVariant &json) {
+        JsonDocument response;
+        if (!priceApiAuthorized(request)) {
+            response["ok"] = false;
+            response["error"] = "unauthorized";
+            sendApiJson(request, 401, response);
+            return;
+        }
+        if (millis() - lastPriceApiRequest < 1000) {
+            response["ok"] = false;
+            response["error"] = "rate limit: wait one second";
+            sendApiJson(request, 429, response);
+            return;
+        }
+        lastPriceApiRequest = millis();
+
+        if (config.runStatus != RUNSTATUS_RUN || apInfo.state != AP_STATE_ONLINE) {
+            response["ok"] = false;
+            response["error"] = "access point is not online";
+            sendApiJson(request, 409, response);
+            return;
+        }
+
+        const JsonObject body = json.as<JsonObject>();
+        const String macString = body["mac"].as<String>();
+        const String product = body["product"].as<String>();
+        const String price = body["price"].as<String>();
+        String currency = body["currency"].is<String>() ? body["currency"].as<String>() : String("RSD");
+        String note = body["note"].is<String>() ? body["note"].as<String>() : String();
+
+        if (!validPriceApiText(product, 60) || !validPriceApiText(price, 20) ||
+            currency.length() > 10 || note.length() > 60) {
+            response["ok"] = false;
+            response["error"] = "invalid product, price, currency, or note length";
+            sendApiJson(request, 400, response);
+            return;
+        }
+
+        uint8_t mac[8];
+        if (!hex2mac(macString, mac)) {
+            response["ok"] = false;
+            response["error"] = "mac must contain 12 or 16 hexadecimal characters";
+            sendApiJson(request, 400, response);
+            return;
+        }
+
+        tagRecord *taginfo = tagRecord::findByMAC(mac);
+        if (taginfo == nullptr) {
+            response["ok"] = false;
+            response["error"] = "tag is not registered";
+            sendApiJson(request, 404, response);
+            return;
+        }
+        if (taginfo->hwType != 17) {
+            response["ok"] = false;
+            response["error"] = "price-v1 currently supports hwType 17 only";
+            sendApiJson(request, 400, response);
+            return;
+        }
+
+        JsonDocument priceTemplate;
+        JsonArray elements = priceTemplate.to<JsonArray>();
+        elements.add<JsonObject>()["box"].to<JsonArray>().add(0);
+        JsonArray box = elements[0]["box"];
+        box.add(0);
+        box.add(296);
+        box.add(128);
+        box.add(0);
+
+        JsonArray productBox = elements.add<JsonObject>()["textbox"].to<JsonArray>();
+        productBox.add(8);
+        productBox.add(5);
+        productBox.add(280);
+        productBox.add(34);
+        productBox.add(product);
+        productBox.add("bahnschrift20");
+        productBox.add(1);
+        productBox.add(1);
+        productBox.add(0);
+
+        JsonArray separator = elements.add<JsonObject>()["line"].to<JsonArray>();
+        separator.add(8);
+        separator.add(42);
+        separator.add(288);
+        separator.add(42);
+        separator.add(1);
+
+        JsonArray priceText = elements.add<JsonObject>()["text"].to<JsonArray>();
+        priceText.add(288);
+        priceText.add(51);
+        priceText.add(price + " " + currency);
+        priceText.add("bahnschrift70");
+        priceText.add(1);
+        priceText.add(2);
+        priceText.add(0);
+
+        if (note.length()) {
+            JsonArray noteText = elements.add<JsonObject>()["text"].to<JsonArray>();
+            noteText.add(8);
+            noteText.add(112);
+            noteText.add(note);
+            noteText.add("REFSAN12");
+            noteText.add(2);
+            noteText.add(0);
+            noteText.add(0);
+        }
+
+        xSemaphoreTake(fsMutex, portMAX_DELAY);
+        const String templatePath = "/current/" + macString + ".json";
+        File file = contentFS->open(templatePath, "w");
+        if (!file) {
+            xSemaphoreGive(fsMutex);
+            response["ok"] = false;
+            response["error"] = "failed to store price template";
+            sendApiJson(request, 500, response);
+            return;
+        }
+        serializeJson(priceTemplate, file);
+        file.close();
+        xSemaphoreGive(fsMutex);
+
+        taginfo->modeConfigJson = "{\"filename\":\"" + templatePath + "\",\"interval\":\"0\"}";
+        taginfo->contentMode = 19;
+        taginfo->nextupdate = 0;
+        wsSendTaginfo(mac, SYNC_USERCFG);
+
+        response["ok"] = true;
+        response["mac"] = macString;
+        response["product"] = product;
+        response["price"] = price;
+        response["currency"] = currency;
+        sendApiJson(request, 202, response);
+    });
+    priceHandler->setMaxContentLength(2048);
+    apiServer.addHandler(priceHandler);
+
+    apiServer.onNotFound([](AsyncWebServerRequest *request) {
+        JsonDocument response;
+        response["ok"] = false;
+        response["error"] = "not found";
+        sendApiJson(request, 404, response);
+    });
+    apiServer.begin();
+}
 
 void wsLog(const String &text) {
     JsonDocument doc;
@@ -552,7 +739,9 @@ void init_web() {
         response->print("\"hasSubGhz\": \"0\", ");
 #endif
 
-        response->print("\"apstate\": \"" + String(apInfo.state) + "\"");
+        response->print("\"apstate\": \"" + String(apInfo.state) + "\", ");
+        response->print("\"apiPort\": 8080, ");
+        response->print("\"apiTokenSet\": " + String(config.apiToken.length() >= 24 ? "true" : "false"));
 
         File configFile = contentFS->open("/current/apconfig.json", "r");
         if (configFile) {
@@ -643,6 +832,15 @@ void init_web() {
         }
         if (request->hasParam("env", true)) {
             config.env = request->getParam("env", true)->value();
+        }
+        if (request->hasParam("apitoken", true)) {
+            String apiToken = request->getParam("apitoken", true)->value();
+            apiToken.trim();
+            if (apiToken.length() < 24 || apiToken.length() > 64) {
+                request->send(400, "text/plain", "API token must contain 24 to 64 characters");
+                return;
+            }
+            config.apiToken = apiToken;
         }
         saveAPconfig();
         setAPchannel();
@@ -852,6 +1050,7 @@ void init_web() {
     DefaultHeaders::Instance().addHeader("Access-Control-Allow-Headers", "content-type");
 
     server.begin();
+    initPriceApi();
 }
 
 #define UPLOAD_BUFFER_SIZE 32768

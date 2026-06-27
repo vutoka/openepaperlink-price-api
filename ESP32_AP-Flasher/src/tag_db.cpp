@@ -344,6 +344,12 @@ void initAPconfig() {
     config.wifiPower = APconfig["wifipower"].is<uint8_t>() ? APconfig["wifipower"] : 34;
     config.repo = APconfig["repo"].is<String>() ? APconfig["repo"].as<String>() : String("OpenEPaperLink/OpenEPaperLink");
     config.env = APconfig["env"].is<String>() ? APconfig["env"].as<String>() : String(STR(BUILD_ENV_NAME));
+    File apiTokenFile = contentFS->open("/current/api_token.txt", "r");
+    if (apiTokenFile) {
+        config.apiToken = apiTokenFile.readString();
+        config.apiToken.trim();
+        apiTokenFile.close();
+    }
     if (APconfig["timezone"]) {
         strlcpy(config.timeZone, APconfig["timezone"], sizeof(config.timeZone));
     } else {
@@ -377,6 +383,11 @@ void saveAPconfig() {
     APconfig["showtimestamp"] = config.showtimestamp;
     serializeJsonPretty(APconfig, configFile);
     configFile.close();
+    fs::File apiTokenFile = contentFS->open("/current/api_token.txt", "w");
+    if (apiTokenFile) {
+        apiTokenFile.print(config.apiToken);
+        apiTokenFile.close();
+    }
     xSemaphoreGive(fsMutex);
 }
 

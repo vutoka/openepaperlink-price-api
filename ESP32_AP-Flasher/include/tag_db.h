@@ -76,6 +76,7 @@ struct Config {
     String repo;
     String env;
     uint8_t showtimestamp;
+    String apiToken;
 };
 
 struct Color {

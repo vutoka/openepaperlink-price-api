@@ -882,6 +882,8 @@ document.addEventListener("loadTab", function (event) {
 						$("#apcnight2").value = data.sleeptime2;
 						$("#apcdiscovery").value = data.discovery;
 						$("#apcshowtimestamp").value = data.showtimestamp;
+						$("#apcapitoken").value = '';
+						$("#apcapistatus").innerHTML = data.apiTokenSet ? ' configured (port 8080)' : ' disabled';
 					}
 				})
 			$('#apcfgmsg').innerHTML = '';
@@ -921,6 +923,7 @@ $('#apcfgsave').onclick = function () {
 	formData.append('sleeptime2', $('#apcnight2').value);
 	formData.append('discovery', $('#apcdiscovery').value);
 	formData.append('showtimestamp', $('#apcshowtimestamp').value);
+	if ($('#apcapitoken').value) formData.append('apitoken', $('#apcapitoken').value);
 	fetch("save_apcfg", {
 		method: "POST",
 		body: formData

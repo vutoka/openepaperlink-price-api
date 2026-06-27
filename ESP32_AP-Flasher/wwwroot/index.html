@@ -487,6 +487,12 @@ options:
 						<option value="1">yes</option>
 					</select>
 				</p>
+				<p title="Bearer token for the isolated price API on TCP port 8080. Use at least 24 random characters. Leave blank to keep the current token.">
+					<label for="apcapitoken">Price API token</label>
+					<input id="apcapitoken" type="password" minlength="24" maxlength="64"
+						   placeholder="Configured token is not displayed">
+					<span id="apcapistatus"></span>
+				</p>
 				<p>
 					<input type="button" value="Save" id="apcfgsave"><span id="apcfgmsg"></span>
 				</p>

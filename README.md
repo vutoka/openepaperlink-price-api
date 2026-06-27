@@ -1,5 +1,20 @@
 # OpenEPaperLink
 
+## About This Fork
+
+This repository is a modified fork of
+[OpenEPaperLink](https://github.com/OpenEPaperLink/OpenEPaperLink).
+
+The original project copyright and license remain with the OpenEPaperLink
+contributors. This fork adds an authenticated ESP32-S3 price API on TCP port
+`8080` for updating e-paper price tags, plus deployment notes for a future
+Cloudflare Tunnel/Raspberry Pi setup.
+
+This fork is shared under the same
+[CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/) license
+as the upstream project. It is not affiliated with or endorsed by the
+OpenEPaperLink project.
+
 This is an alternative firmware and protocol for the multiple Electronic Shelf Labels. It can be used to set up E-Paper tags and supply them with content.
 
 The software in this project consists of two parts: Accesspoint-firmware and Tag firmware.
