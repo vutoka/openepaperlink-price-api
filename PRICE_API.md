@@ -4,6 +4,25 @@ The preferred API runs directly on the ESP32-S3 on TCP port `8080`. Port 80
 remains the local OpenEPaperLink administration interface and must not be
 forwarded to the Internet.
 
+For production, expose the Raspberry Pi proxy instead of exposing the ESP
+directly:
+
+```text
+Home server / Postman
+  -> HTTPS Cloudflare hostname
+Cloudflare Tunnel
+  -> Raspberry Pi http://localhost:8000
+Raspberry proxy
+  -> ESP32-S3 http://ESP_IP:8080
+```
+
+Use separate tokens:
+
+```text
+PUBLIC_API_TOKEN = home server -> Raspberry proxy
+ESP_API_TOKEN    = Raspberry proxy -> ESP32-S3 API
+```
+
 ## S3 firmware API
 
 The custom `ESP32_S3_SIMPLE_AP` firmware provides:
@@ -59,7 +78,15 @@ asynchronously when the tag checks in.
 
 ### Internet access
 
-Configure the router to forward one chosen external TCP port only to:
+Do not forward ports in production when using Cloudflare Tunnel. Configure the
+Cloudflare public hostname to point to the Raspberry-local proxy:
+
+```text
+http://localhost:8000
+```
+
+If Cloudflare Tunnel is not used, a less preferred direct-router setup would
+forward one chosen external TCP port only to:
 
 ```text
 192.168.0.24:8080
@@ -79,6 +106,37 @@ The separate API port prevents access to the S3 administration, OTA, reboot,
 and filesystem endpoints, but it cannot provide confidentiality or transport
 integrity. Use a long random token, rotate it if exposed, and restrict source
 IPs on the router when possible.
+
+## Raspberry Pi proxy
+
+The Pi proxy files are:
+
+```text
+tools/raspberry_price_proxy.py
+tools/price-proxy.service
+tools/price-proxy.env.example
+```
+
+Installed target paths:
+
+```text
+/opt/price-proxy/app.py
+/etc/price-proxy.env
+/etc/systemd/system/price-proxy.service
+```
+
+Example environment:
+
+```text
+PRICE_PROXY_LISTEN=127.0.0.1
+PRICE_PROXY_PORT=8000
+ESP_BASE_URL=http://ESP_IP:8080
+PUBLIC_API_TOKEN=replace-with-random-public-token
+ESP_API_TOKEN=replace-with-esp-token
+ESP_FORWARD_TIMEOUT=15
+```
+
+Do not commit `/etc/price-proxy.env` or real token values.
 
 ## Optional computer-side proxy
 

@@ -1,0 +1,17 @@
+[Unit]
+Description=OpenEPaperLink price proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=trivan
+Group=trivan
+WorkingDirectory=/opt/price-proxy
+EnvironmentFile=/etc/price-proxy.env
+ExecStart=/usr/bin/python3 /opt/price-proxy/app.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

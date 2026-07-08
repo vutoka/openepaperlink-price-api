@@ -215,14 +215,28 @@ External client / Postman / business app
         -> HTTPS
 Cloudflare Tunnel
         -> Raspberry Pi on local network
+        -> local HTTP proxy on localhost:8000
+Raspberry Pi proxy
         -> HTTP on LAN
 ESP32-S3 OpenEPaperLink AP API, port 8080
         -> C6 radio
         -> e-paper tags
 ```
 
-The Raspberry Pi will not run the price API. It will only run `cloudflared` as
-a stable tunnel to the S3 API.
+The Raspberry Pi now runs a small local price proxy and will also run
+`cloudflared`. Cloudflare should point to the Pi proxy, not directly to the S3.
+The proxy validates a public bearer token from the home server and forwards
+valid requests to the ESP32-S3 API with the ESP token.
+
+Installed on the Pi:
+
+- `/opt/price-proxy/app.py`
+- `/etc/price-proxy.env`
+- `/etc/systemd/system/price-proxy.service`
+
+The service was installed as `disabled` and `inactive` until live validation is
+completed. The env file is root-only (`0600`) and must not be copied into the
+repo.
 
 Recommended hardware:
 
@@ -240,13 +254,15 @@ Setup plan:
 3. Connect the Pi to the same LAN as the S3, preferably over Ethernet.
 4. Reserve the S3 IP address in the router.
 5. Install `cloudflared`.
-6. Confirm the Pi can call `http://192.168.0.24:8080/health`.
+6. Confirm the Pi can call `http://ESP_IP:8080/health`.
 7. Create a named Cloudflare Tunnel.
 8. Configure only the public API hostname to forward to
-   `http://192.168.0.24:8080`.
+   `http://localhost:8000`.
 9. Install the tunnel as a `systemd` service.
-10. Rotate the S3 bearer token before production.
-11. Test public `GET /health` and `POST /price`.
+10. Rotate the Pi public bearer token and the S3 bearer token before
+    production.
+11. Test local proxy `GET /health` and `POST /price`, then test public
+    `GET /health` and `POST /price`.
 12. Stop the temporary Windows Quick Tunnel.
 
 ### Production hardening
@@ -254,12 +270,13 @@ Setup plan:
 Planned but not done:
 
 - Rotate the S3 bearer token.
+- Rotate the Pi public bearer token.
 - Move from temporary `trycloudflare.com` URL to a named Cloudflare Tunnel and
   stable hostname.
 - Add router DHCP reservation for S3.
 - Decide whether to add Tailscale for private admin access.
-- Decide whether to add a Pi-side backend only if product catalog, barcode
-  mapping, audit logs, retry queues, or multi-store support become necessary.
+- Extend the Pi-side proxy only if product catalog, barcode mapping, audit logs,
+  retry queues, or multi-store support become necessary.
 
 ### Power reliability
 

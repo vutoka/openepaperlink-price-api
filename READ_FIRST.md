@@ -41,9 +41,10 @@ yet completed production setup.
 The ESP32-S3 firmware has been modified, built, flashed, and verified. It runs
 an authenticated price API on port `8080`, separate from the OpenEPaperLink
 admin UI on port `80`. A test tag was updated successfully through
-`POST /price`. A temporary Cloudflare Quick Tunnel from a Windows computer was
-tested. The planned production step is to move the tunnel to a Raspberry Pi
-using a named Cloudflare Tunnel and stable hostname.
+`POST /price`. A Raspberry Pi 3B has been prepared and a local proxy has been
+installed on it, but the proxy has not yet been live-validated or enabled. The
+planned production step is to point a named Cloudflare Tunnel and stable
+hostname to the Raspberry proxy at `http://localhost:8000`.
 
 ## Critical Rules
 
@@ -52,8 +53,9 @@ using a named Cloudflare Tunnel and stable hostname.
 - Do not commit real bearer tokens or Cloudflare credentials.
 - Use the S3 `COM` connector for this hardware setup.
 - If the AP/radio link fails after reset, reset S3 first, then reset C6.
-- Raspberry Pi work is planned future work unless a later note says it was
-  completed.
+- Raspberry Pi base setup and proxy installation are done, but live proxy
+  validation, service enablement, and Cloudflare production tunnel setup are
+  still pending.
 
 ## Before Pushing To Git
 

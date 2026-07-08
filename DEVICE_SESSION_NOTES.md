@@ -199,3 +199,90 @@ Security boundary:
 - Never expose S3 port `80`; it contains the administration and OTA interface.
 - Cloudflare provides HTTPS between the external client and Cloudflare, and
   the Pi forwards HTTP only inside the trusted local network to the S3.
+
+## 2026-07-08 / 2026-07-09
+
+### Raspberry Pi setup
+
+- Raspberry Pi 3B was prepared with Raspberry Pi OS Lite.
+- Hostname: `price-pi`.
+- User: `trivan`.
+- SSH key-based login from the Windows laptop was configured.
+- Windows private key path:
+  `C:\Users\Vuk Djokic\.ssh\price-pi_ed25519`.
+- Initial phone hotspot network:
+  - Phone/gateway: `192.168.31.10`
+  - Windows laptop: `192.168.31.66`
+  - Raspberry Pi: `192.168.31.93`
+- The Pi was updated with `apt update` and `apt full-upgrade`, then rebooted
+  successfully.
+
+### Raspberry price proxy
+
+- A Raspberry-local proxy was added in the repository:
+  - `tools/raspberry_price_proxy.py`
+  - `tools/price-proxy.service`
+  - `tools/price-proxy.env.example`
+- The proxy uses only the Python standard library.
+- Local mock tests passed:
+  - bad public token returns `401`;
+  - `GET /health` forwards to the ESP API;
+  - `POST /price` forwards and preserves the ESP `202` response.
+- Files were installed on the Pi:
+  - `/opt/price-proxy/app.py`
+  - `/etc/price-proxy.env`
+  - `/etc/systemd/system/price-proxy.service`
+- `/etc/price-proxy.env` is root-only (`0600`) and must not be committed.
+- The `price-proxy` systemd service was left `disabled` and `inactive` until
+  live validation is completed.
+
+### ESP Wi-Fi recovery and current IP
+
+- The ESP32-S3 had old Wi-Fi credentials for an unavailable network.
+- The expected fallback SSID is `OpenEPaperLink`, with no password, and setup
+  URL `http://192.168.4.1/setup`.
+- On this `ESP32_S3_SIMPLE_AP` build, holding `BOOT/GPIO0` did not expose the
+  fallback network. This is consistent with the build using
+  `ARDUINO_USB_CDC_ON_BOOT` but not `HAS_USB`; the GPIO0 reset path in
+  `wifimanager.cpp` is behind `#ifndef HAS_USB` and did not help in this
+  hardware session.
+- The working recovery path was Improv serial provisioning over the S3 USB/COM
+  connector.
+- Confirmed S3 serial port: `COM16`.
+- The ESP was provisioned to the current hotspot/store Wi-Fi through the Improv
+  serial protocol. Do not commit the Wi-Fi SSID/password.
+- After provisioning, the ESP appeared on the hotspot as:
+  - ESP32-S3 API/admin IP: `192.168.31.203`
+  - MAC observed from Raspberry neighbor table: `ac:a7:04:26:a2:ac`
+- From Raspberry, `http://192.168.31.203/` returned HTTP `200`.
+- From Raspberry, unauthenticated
+  `http://192.168.31.203:8080/health` returned:
+
+```json
+{"ok":false,"error":"unauthorized"}
+```
+
+This confirms the ESP price API is reachable and requires a bearer token.
+
+### Tokens and stopping point
+
+- New random tokens were generated locally during the session:
+  - one ESP API token for Raspberry -> ESP;
+  - one public API token for home server -> Raspberry.
+- The ESP token was submitted to the ESP admin endpoint
+  `POST /save_apcfg` as form field `apitoken`.
+- `/etc/price-proxy.env` on the Pi was updated with:
+  - `ESP_BASE_URL=http://192.168.31.203:8080`
+  - generated `PUBLIC_API_TOKEN`
+  - generated `ESP_API_TOKEN`
+- The actual token values are intentionally not stored in this repository.
+- The session stopped before completing the final live proxy health check and
+  before enabling/starting `price-proxy`.
+
+Next steps:
+
+1. Test the ESP API from the Pi using the protected env file.
+2. Start and enable `price-proxy`.
+3. Test `http://127.0.0.1:8000/health` on the Pi.
+4. Test `POST /price` through the Pi proxy.
+5. Configure named Cloudflare Tunnel to point to `http://localhost:8000`.
