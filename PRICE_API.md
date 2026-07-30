@@ -138,6 +138,35 @@ ESP_FORWARD_TIMEOUT=15
 
 Do not commit `/etc/price-proxy.env` or real token values.
 
+## Cloudflare Quick Tunnel on the Raspberry Pi
+
+Until a named tunnel with a stable hostname is set up (requires a domain in
+the Cloudflare account), the Pi runs a Cloudflare Quick Tunnel pointed at the
+local proxy. The unit file is:
+
+```text
+tools/cloudflared-quicktunnel.service
+```
+
+Installed target path:
+
+```text
+/etc/systemd/system/cloudflared-quicktunnel.service
+```
+
+It depends on and starts after `price-proxy.service`, and forwards
+`https://<random>.trycloudflare.com` to `http://localhost:8000` (the proxy,
+not the ESP directly).
+
+The quick tunnel has no uptime guarantee and gets a new random hostname every
+time the service restarts. After the Pi boots or the service restarts, read
+the current URL from the journal:
+
+```bash
+sudo journalctl -u cloudflared-quicktunnel --no-pager \
+  | grep -o 'https://[a-zA-Z0-9.-]*trycloudflare.com' | tail -1
+```
+
 ## Optional computer-side proxy
 
 The older helper below remains available when HTTPS termination or a more

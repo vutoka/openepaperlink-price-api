@@ -1,0 +1,14 @@
+[Unit]
+Description=Cloudflare Quick Tunnel for price-proxy
+After=network-online.target price-proxy.service
+Wants=network-online.target
+Requires=price-proxy.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/cloudflared tunnel --url http://localhost:8000 --no-autoupdate
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
