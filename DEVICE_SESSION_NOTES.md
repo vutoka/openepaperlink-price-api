@@ -286,3 +286,57 @@ Next steps:
 3. Test `http://127.0.0.1:8000/health` on the Pi.
 4. Test `POST /price` through the Pi proxy.
 5. Configure named Cloudflare Tunnel to point to `http://localhost:8000`.
+
+## 2026-07-31
+
+### Full stack power-on and end-to-end verification
+
+- All three components (ESP32-S3/C6, Raspberry Pi, and the Windows laptop used
+  for testing) were power-cycled independently on the phone hotspot network
+  (`192.168.31.0/24`) and verified end to end.
+- `price-proxy.service` and `cloudflared-quicktunnel.service` were confirmed
+  `active`/`enabled` and started automatically without manual intervention.
+- The Cloudflare Quick Tunnel hostname is random per service start; the
+  current URL was read from
+  `sudo journalctl -u cloudflared-quicktunnel | grep -o 'https://[a-zA-Z0-9.-]*trycloudflare.com' | tail -1`
+  as documented in `PRICE_API.md`.
+- A real authenticated `POST /price` was sent through the public tunnel URL
+  and reached the tag successfully (`esp_status: 202`).
+
+### Troubleshooting: Pi could not reach the ESP over Wi-Fi
+
+- After power-on, the ESP API was reachable directly from the Windows laptop
+  (`192.168.31.203`, HTTP `200`/`401` as expected), but the Raspberry Pi could
+  not reach the same address: `ping` returned `Destination Host Unreachable`
+  and `ip neigh show 192.168.31.203` showed state `FAILED`, even after
+  `ip neigh flush`.
+- This was an ARP/Layer-2 resolution problem between those two specific
+  Wi-Fi clients on the phone hotspot, not a code, config, token, DNS, or
+  Cloudflare Tunnel problem — the proxy, tunnel, and bearer token were all
+  independently confirmed correct while this was happening (the proxy's own
+  error was `"cannot reach ESP API: [Errno 113] No route to host"`).
+- The same Pi-to-ESP path had worked earlier in a previous session over the
+  same hotspot (see 2026-07-08/09 above), so this looked like a transient
+  hotspot ARP-table glitch rather than a fixed client-isolation policy.
+- Toggling airplane mode on the hotspot phone briefly to try to force an ARP
+  refresh made things worse: the hotspot dropped for a few seconds, and the
+  ESP32-S3 fell back to its own standalone AP (`OpenEPaperLink`, no password,
+  setup page at `http://192.168.4.1/setup` — see the 2026-07-08/09 note above)
+  instead of automatically rejoining the hotspot. The Windows laptop and the
+  Pi both silently rejoined the hotspot on their own.
+- Power-cycling the ESP32-S3 (not just the hotspot) fixed both problems at
+  once: it rejoined the hotspot cleanly on the same address (`192.168.31.203`)
+  and the Pi could then reach it immediately (confirmed via `curl`, and the
+  proxy's `/health` and `/price` forwarding both worked afterward).
+
+### Takeaway for next time
+
+- If the Pi-to-ESP hop fails with `No route to host` right after powering
+  everything on, the fastest fix observed was a plain power-cycle of the
+  ESP32-S3 board, not the hotspot/router. Restarting the hotspot risks
+  knocking the ESP into its fallback AP mode, which requires re-provisioning
+  Wi-Fi credentials via `http://192.168.4.1/setup` (or Improv serial) to
+  recover.
+- This class of intermittent Wi-Fi/ARP issue between Pi and ESP is a known
+  weakness of the phone-hotspot setup and is the main reason the production
+  plan recommends Ethernet for the Raspberry Pi (see `AI_CONTEXT.md`).
