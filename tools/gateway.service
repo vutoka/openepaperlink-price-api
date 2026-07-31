@@ -1,0 +1,18 @@
+[Unit]
+Description=ESL gateway (PACMS price sync)
+After=network-online.target price-proxy.service
+Wants=network-online.target
+Requires=price-proxy.service
+
+[Service]
+Type=simple
+User=trivan
+Group=trivan
+WorkingDirectory=/opt/gateway
+EnvironmentFile=/etc/gateway.env
+ExecStart=/usr/bin/python3 /opt/gateway/gateway.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

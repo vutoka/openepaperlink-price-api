@@ -53,3 +53,6 @@ device_backups/
 # Local secret/config files
 .env
 .env.*
+
+# Per-store gateway data (tag/SKU mapping, price cache) is operational data, not code
+*.db
