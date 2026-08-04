@@ -390,3 +390,47 @@ reboot leaves the C6 on its previously negotiated UART baud rate (see the
   tag. This has cleared itself on the tag's next normal check-in in
   practice; if it doesn't, forcing a fresh check-in (button/NFC on the tag,
   or a battery pull) should get a clean packet.
+
+### `apstate: 5` (AP_STATE_FAILED) and the yellow/blinking LED
+
+Later the same session, `apstate` moved to `5` (`AP_STATE_FAILED` in
+`include/serialap.h`; the enum is `0 OFFLINE, 1 ONLINE, 2 FLASHING,
+3 WAIT_RESET, 4 REQUIRED_POWER_CYCLE, 5 FAILED, 6 COMING_ONLINE,
+7 NORADIO`) while every tag's reported telemetry became garbage at once
+(`hwType`, `batteryMv`, `temperature`, `ver` all nonsensical/inconsistent
+across tags that had previously reported clean values).
+
+- The firmware has its own watchdog for this (`serialap.cpp` around line
+  1083): if the S3 gets no valid activity from the C6 for too long while
+  `ONLINE` or already `FAILED`, it automatically retries a ping, and after
+  5 failed attempts calls `bringAPOnline()` to reset the C6 itself in
+  software. If that auto-recovery also fails, it sets `AP_STATE_FAILED`
+  and plays an explicit `Yellow, Yellow, Red` LED pattern
+  (`showColorPattern`, `serialap.cpp:1098`) — this is the "blinking LED"
+  symptom. It then re-arms itself to retry again after another interval.
+- Resetting only the C6 by hand while the S3 had been running continuously
+  reproduced the same baud-desync failure mode as before, just mirrored:
+  `apstate` oscillated between `0` (OFFLINE) and `5` (FAILED) for at least
+  a minute and never reached `1`.
+- Restarting **both** boards again in the documented order (S3 first, then
+  C6) did bring `apstate` back to `1`, with tags checking in on schedule
+  (fresh `lastseen` every cycle) — but this time the corrupted-telemetry
+  side effect did **not** self-clear on later check-ins the way it did
+  earlier in the day. `hwType` stayed `0` (the tagRecord default in
+  `tag_db.h`, not `17`) across several consecutive fresh check-ins for the
+  same tag, and two extra phantom tag entries appeared with all-zero
+  fields and MAC addresses that were near-duplicates of a real tag's MAC
+  (one byte different) — consistent with bit-level corruption on the
+  radio link rather than a one-off sync glitch.
+- A normal-looking tag screen does **not** confirm the link is healthy: an
+  e-ink display holds its last successfully delivered image with no power
+  and no connection, so it can look fine while the live link underneath is
+  degraded.
+- Not yet confirmed whether a full power-off (unplug, not just the reset
+  button) of both boards for ~30 seconds clears this, versus needing more
+  time for the RF environment to settle, versus a genuine hardware issue
+  (antenna/connector on the C6 board). Picking this up is the first thing
+  to check next session — retry the sequence, and if `hwType`/`batteryMv`
+  are still wrong after a full cold power-off, escalate to a physical
+  inspection of the C6 board's antenna/connector rather than more
+  restarts.
