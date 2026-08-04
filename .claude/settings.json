@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "shell": "bash",
+            "command": "echo '{\"systemMessage\": \"Redosled paljenja: 1) hotspot, 2) ESP32-S3 (sacekaj da se web interfejs digne), 3) tek onda C6, 4) proveri /get_db da neki tag ima svez lastseen (ne veruj samo apstate), 5) Raspberry Pi poslednji. Detalji: DEVICE_SESSION_NOTES.md, sekcija 2026-08-04.\"}'"
+          }
+        ]
+      }
+    ]
+  }
+}

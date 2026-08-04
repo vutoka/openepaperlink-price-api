@@ -56,3 +56,6 @@ device_backups/
 
 # Per-store gateway data (tag/SKU mapping, price cache) is operational data, not code
 *.db
+
+# Personal Claude Code permission overrides, not shared across machines
+.claude/settings.local.json

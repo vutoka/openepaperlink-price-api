@@ -340,3 +340,53 @@ Next steps:
 - This class of intermittent Wi-Fi/ARP issue between Pi and ESP is a known
   weakness of the phone-hotspot setup and is the main reason the production
   plan recommends Ethernet for the Raspberry Pi (see `AI_CONTEXT.md`).
+
+## 2026-08-04
+
+### Standard power-on order
+
+Follow this order every time the full stack is powered on from cold. Doing
+S3 and C6 in the wrong order (or together) can leave the C6 radio
+desynchronized from the S3 even while the AP reports `apstate: 1` (looks
+"online" but no tag actually checks in):
+
+1. Turn on the phone hotspot and wait a few seconds for it to stabilize.
+2. Power on the ESP32-S3 first. Wait until its web interface
+   (`http://<esp-ip>/`, currently `http://192.168.31.203/`) loads normally.
+3. Only then power on/reset the C6. Wait 10-20 seconds.
+4. Confirm real radio connectivity, not just `apstate`: check `/get_db` (or
+   the web UI) for at least one tag with a recent `lastseen`. `apstate: 1`
+   alone does not prove the C6 link is healthy — it only reflects the
+   S3-C6 UART handshake.
+5. Power on the Raspberry Pi last, so `price-proxy` succeeds on its first
+   attempt instead of retrying while the ESP is still booting.
+6. Read the new Quick Tunnel URL from the Pi:
+   `sudo journalctl -u cloudflared-quicktunnel --no-pager | grep -o 'https://[a-zA-Z0-9.-]*trycloudflare.com' | tail -1`
+
+Tag check-in after a cold C6 restart can take several minutes (tags only
+wake on their own schedule), not seconds — do not assume failure too early.
+
+### Root cause found for a stuck "disconnected" tag icon
+
+On this date, all 6 known tags had not checked in for ~15.5 hours (frozen
+`lastseen` across all of them, not just one), while `apstate` reported `1`
+the entire time. `nightlyreboot: 1` is enabled in the AP config (reboots at
+03:56 if uptime > 2h); this is the suspected trigger, since an S3-only
+reboot leaves the C6 on its previously negotiated UART baud rate (see the
+2026-06-14 note above).
+
+- A simultaneous power-cycle of both boards did not fix it.
+- The sequential order above (S3 first, then C6) did fix it, but the
+  recovery was not instantaneous — it took several minutes after the C6
+  reset before tags started reporting fresh `lastseen` values.
+- One side effect observed: the tag data for the very first check-in after
+  a long radio outage can be corrupted/garbage (e.g. `hwType: 253` with no
+  matching `resources/tagtypes/FD.json`, plus an impossible `temperature`
+  and out-of-range `batteryMv` in the same record). `hwType 253` is not a
+  real tag type here; the tag had reported `hwType: 17` in every prior
+  session. `web.cpp`'s price endpoint hard-rejects anything but
+  `hwType == 17`, so a price POST right after reconnect can fail with
+  `"price-v1 currently supports hwType 17 only"` even for a known-good
+  tag. This has cleared itself on the tag's next normal check-in in
+  practice; if it doesn't, forcing a fresh check-in (button/NFC on the tag,
+  or a battery pull) should get a clean packet.
