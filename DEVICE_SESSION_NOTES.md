@@ -434,3 +434,93 @@ across tags that had previously reported clean values).
   are still wrong after a full cold power-off, escalate to a physical
   inspection of the C6 board's antenna/connector rather than more
   restarts.
+
+## 2026-08-05
+
+### Root cause #1: S3 firmware crash on repeated recovery attempts
+
+Live serial debugging (PuTTY on the S3's `COM` port, 115200 baud) caught a
+reproducible `Guru Meditation Error: Core 0 panic'ed (Double exception)`
+(`EXCCAUSE 0x2`, identical `PC 0x40381ae2` both times), occurring every time
+several `rxSerialTask starting` lines appeared before any matching `rxSerialTask
+stopped` line. Re-wiring the S3<->C6 UART lines did **not** stop the crash from
+recurring — proof the crash itself is a firmware bug, not a wiring symptom
+(the wiring problem, found separately below, is what *triggers* the recovery
+path that exposes this bug).
+
+Root cause (`ESP32_AP-Flasher/src/serialap.cpp`, `ota.cpp`,
+`include/serialap.h`): `rxSerialTask()` keeps its protocol state in `static`
+locals (`cmdbuffer`, `packetp`, `pktindex`, `RXState`, `charindex`), shared by
+every instance of the task rather than per-instance. `bringAPOnline()`'s
+task-creation check (`if (gSerialTaskState != SERIAL_STATE_RUNNING) { ...
+xTaskCreate(...) }`) was unguarded, and the only place that requests a stop
+(`ota.cpp`'s `C6firmwareUpdateTask`, used by the C6 OTA-flash web route) only
+set `gSerialTaskState = SERIAL_STATE_STOP` and waited a flat, unconditional
+500ms — it never actually confirmed the old task reached
+`SERIAL_STATE_STOPPED`. Under repeated failed-ping recovery cycles, this let a
+second `rxSerialTask` start while the first one was still alive, and the two
+instances corrupted the shared static state / heap pointer, producing the
+crash.
+
+Fix: added `serialTaskLifecycleMutex` (`SemaphoreHandle_t`, same idiom as the
+existing `txActive`/`fsMutex`/`wsMutex`) and a `stopRxSerialTask(timeoutMs)`
+helper that actually polls for `SERIAL_STATE_STOPPED` before returning.
+`bringAPOnline()`'s task-creation block and `ota.cpp`'s stop sequence both now
+take this mutex, guaranteeing at most one live `rxSerialTask` instance at any
+time. Built (`pio run -e ESP32_S3_SIMPLE_AP`, success) and flashed to the S3
+over `COM16`. Confirmed on hardware: the same trigger scenario that reliably
+crashed the board twice in a row (with `RTC_SW_CPU_RST` in the reboot log) no
+longer crashes it — subsequent resets show `rst:0x1 (POWERON)` only, i.e.
+caused by manual power-cycling, not a panic.
+
+### Root cause #2: C6 wires were on the wrong physical pins
+
+The C6 dev board's pins silkscreened **"TX"/"RX"** are its primary console
+UART (the same UART already carried out over USB by the onboard CH343 bridge
+chip, visible on the host PC as a `USB-Enhanced-SERIAL CH343` COM port). The
+firmware's actual S3<->C6 link uses a *separate* hardware UART
+(`ARM_Tag_FW/OpenEPaperLink_esp32_C6_AP/main/second_uart.c`, UART port 1), on
+different fixed GPIOs — for the "Default" hardware profile (the one active
+here; see `main/second_uart.h`):
+
+```text
+C6 GPIO 2 = RX
+C6 GPIO 3 = TX
+```
+
+The wires had been connected to the "TX"/"RX"-labeled pins instead, meaning
+the S3 was never talking to the pins the firmware actually listens on. This
+also explained a side symptom found while debugging: connecting the S3 wires
+caused the C6's own CH343 console to go completely silent (bus contention —
+S3 driving the same physical UART0 lines the CH343 chip uses), and
+reconnecting only the C6 side to console showed no interference at all when
+disconnected from S3, isolating it to those specific pins.
+
+**New diagnostic technique for future sessions**: the C6 has its own
+independent USB-serial console (CH343 bridge port, separate from whatever the
+S3 exposes) that can be watched on its own, with no dependency on the S3 link
+at all. While debugging, this showed the C6's own 802.15.4 radio actively
+receiving/transmitting real frames to a tag (`RADIO: RX <len>` /
+`RADIO: TX <len>` log lines, from `esp_ieee802154_receive_done`/
+`_transmit_done` in `main/radio.c` — the printed number is the frame length in
+bytes, not a GPIO pin) *even while the S3<->C6 UART link was completely dead*.
+This is the fastest way in the future to tell "C6 and its radio are fine, the
+S3 link specifically is the problem" apart from "C6 itself is dead" — connect
+directly to the C6's own console before assuming the whole board has failed.
+
+After moving both signal wires to C6 GPIO2/GPIO3 (S3 side unchanged: S3 GPIO2
+-> C6 GPIO2, S3 GPIO1 <- C6 GPIO3, common GND unchanged): the C6 console
+stayed alive with the S3 connected (no more silence), and began logging
+`MAIN: RDY? In` roughly every 30 seconds (`main/main.c`, the C6 recognizing an
+incoming `RDY?` ping from the S3's watchdog loop and replying `ACK>`) —
+confirming two-way UART traffic for the first time this session.
+`GET /get_ap_config` on the S3 (`http://192.168.31.203/`) confirmed
+`"apstate": "1"` (ONLINE).
+
+**Not yet fully closed**: `GET /get_db` at the same point still showed
+`lastseen` values roughly 32 hours old (from before this session's fixes),
+not a fresh check-in. Per the existing note above, tag check-in after a link
+recovery can take several minutes and shouldn't be judged as failed
+immediately — next session should re-check `/get_db` for a `lastseen` close
+to current time to confirm a real tag round-trip end-to-end, not just a
+healthy `apstate`.

@@ -39,6 +39,8 @@ enum ApSerialState {
 };
 
 extern volatile ApSerialState gSerialTaskState;
+extern SemaphoreHandle_t serialTaskLifecycleMutex;
+bool stopRxSerialTask(uint32_t timeoutMs = 1000);
 
 void APTask(void* parameter);
 

@@ -21,6 +21,7 @@
 
 QueueHandle_t rxCmdQueue;
 SemaphoreHandle_t txActive;
+SemaphoreHandle_t serialTaskLifecycleMutex;
 
 // If a command is sent, it will wait for a reply here
 #define CMD_REPLY_WAIT 0x00
@@ -168,16 +169,10 @@ void setAPstate(bool isOnline, uint8_t state) {
 #ifdef FLASHER_DEBUG_SHARED
     // Flasher shares port with AP comms
     if (state == AP_STATE_FLASHING) {
-        LOG("Shared COM port, gSerialTaskState %d\n", gSerialTaskState);
-        gSerialTaskState = SERIAL_STATE_STOP;
-        for (int i = 0; i < 100; i++) {
-            vTaskDelay(1 / portTICK_RATE_MS);
-            if (gSerialTaskState == SERIAL_STATE_STOPPED) {
-                gSerialTaskState = SERIAL_STATE_NONE;
-                break;
-            }
-        }
-        LOG("gSerialTaskState %d\n", gSerialTaskState);
+        xSemaphoreTake(serialTaskLifecycleMutex, portMAX_DELAY);
+        stopRxSerialTask(100);
+        gSerialTaskState = SERIAL_STATE_NONE;
+        xSemaphoreGive(serialTaskLifecycleMutex);
     }
 #endif
     wsSendSysteminfo();
@@ -701,6 +696,20 @@ void rxSerialTask(void* parameter) {
     vTaskDelete(NULL);
 }
 
+bool stopRxSerialTask(uint32_t timeoutMs) {
+    if (gSerialTaskState != SERIAL_STATE_RUNNING) return true;
+    gSerialTaskState = SERIAL_STATE_STOP;
+    uint32_t start = millis();
+    while (gSerialTaskState != SERIAL_STATE_STOPPED) {
+        if (millis() - start > timeoutMs) {
+            LOG("stopRxSerialTask: timed out waiting for rxSerialTask to stop\n");
+            return false;
+        }
+        vTaskDelay(10 / portTICK_PERIOD_MS);
+    }
+    return true;
+}
+
 #if defined(FLASHER_DEBUG_RXD) && !defined(FLASHER_DEBUG_SHARED)
 uint32_t millisDiff(uint32_t m) {
     uint32_t ms = millis();
@@ -842,11 +851,13 @@ bool bringAPOnline(uint8_t newState) {
 #endif
         gSerialTaskState = SERIAL_STATE_INITIALIZED;
     }
+    xSemaphoreTake(serialTaskLifecycleMutex, portMAX_DELAY);
     if (gSerialTaskState != SERIAL_STATE_RUNNING) {
         gSerialTaskState = SERIAL_STATE_STARTING;
         xTaskCreate(rxSerialTask, "rxSerialTask", 1750, NULL, 11, NULL);
         vTaskDelay(500 / portTICK_PERIOD_MS);
     }
+    xSemaphoreGive(serialTaskLifecycleMutex);
     setAPstate(false, AP_STATE_OFFLINE);
     // try without rebooting
     AP_SERIAL_PORT.updateBaudRate(115200);
@@ -908,6 +919,7 @@ bool checkRadio() {
 }
 
 void APTask(void* parameter) {
+    serialTaskLifecycleMutex = xSemaphoreCreateMutex();
     if (!checkRadio()) {
         // no radio
         Serial.println("Working without radio.");

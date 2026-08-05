@@ -311,14 +311,15 @@ void C6firmwareUpdateTask(void* parameter) {
     LOG("C6firmwareUpdateTask: url '%s'\n", urlPtr);
     wsSerial("Stopping AP service");
 
-    gSerialTaskState = SERIAL_STATE_STOP;
     config.runStatus = RUNSTATUS_STOP;
     setAPstate(false, AP_STATE_FLASHING);
 #ifndef FLASHER_DEBUG_SHARED
     extern bool rxSerialStopTask2;
     rxSerialStopTask2 = true;
 #endif
-    vTaskDelay(500 / portTICK_PERIOD_MS);
+    xSemaphoreTake(serialTaskLifecycleMutex, portMAX_DELAY);
+    stopRxSerialTask();
+    xSemaphoreGive(serialTaskLifecycleMutex);
     Serial1.end();
     setAPstate(false, AP_STATE_FLASHING);
 
