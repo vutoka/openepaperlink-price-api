@@ -40,6 +40,11 @@ def connect() -> sqlite3.Connection:
     return conn
 
 
+def get_mapped_skus(conn: sqlite3.Connection) -> list[str]:
+    rows = conn.execute("SELECT DISTINCT sku FROM tag_mapping ORDER BY sku").fetchall()
+    return [row[0] for row in rows]
+
+
 def cmd_add(args: argparse.Namespace) -> None:
     with connect() as conn:
         conn.execute(

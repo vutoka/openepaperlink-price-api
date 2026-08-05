@@ -7,10 +7,13 @@ import json
 import os
 import secrets
 import sys
+import threading
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
+
+import gateway
 
 
 LISTEN_HOST = os.getenv("PRICE_PROXY_LISTEN", "127.0.0.1")
@@ -41,6 +44,10 @@ def require_config() -> None:
     ]
     if missing:
         raise RuntimeError(f"Missing required environment: {', '.join(missing)}")
+    gateway.require_config()
+
+
+_sync_lock = threading.Lock()
 
 
 def read_json_body(handler: BaseHTTPRequestHandler) -> dict[str, Any]:
@@ -133,19 +140,32 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         try:
             self.authenticate()
-            if self.path != "/price":
+            if self.path == "/price":
+                payload = read_json_body(self)
+                esp_status, esp_payload = forward_to_esp("/price", "POST", payload)
+                self.send_json(
+                    esp_status,
+                    {
+                        "ok": 200 <= esp_status < 300,
+                        "proxy": "price-proxy-v1",
+                        "esp_status": esp_status,
+                        "esp": esp_payload,
+                    },
+                )
+            elif self.path == "/sync-now":
+                if not _sync_lock.acquire(blocking=False):
+                    raise ProxyError(409, "sync already in progress")
+                try:
+                    conn = gateway.connect()
+                    try:
+                        summary = gateway.sync_once(conn)
+                    finally:
+                        conn.close()
+                finally:
+                    _sync_lock.release()
+                self.send_json(200, {"ok": True, **summary})
+            else:
                 raise ProxyError(404, "endpoint not found")
-            payload = read_json_body(self)
-            esp_status, esp_payload = forward_to_esp("/price", "POST", payload)
-            self.send_json(
-                esp_status,
-                {
-                    "ok": 200 <= esp_status < 300,
-                    "proxy": "price-proxy-v1",
-                    "esp_status": esp_status,
-                    "esp": esp_payload,
-                },
-            )
         except ProxyError as exc:
             self.send_json(exc.status, {"ok": False, "error": exc.message})
 

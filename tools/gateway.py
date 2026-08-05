@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""ESL gateway: pulls price changes from PACMS and pushes them to tags.
+"""ESL gateway: pulls prices for this store's tagged SKUs from PACMS and
+pushes changed ones to tags.
 
-Runs entirely on the Raspberry Pi. PACMS never knows tags exist; this script
-is the only thing that bridges the two. Each cycle:
+Runs on the Raspberry Pi, called on demand (via the price-proxy's
+POST /sync-now route, or directly for manual testing over SSH) -- there is
+no background loop. PACMS never knows tags exist; this script is the only
+thing that bridges the two. Each call:
 
-    1. Pull products changed since the last cycle from PACMS (GET /api/Esl/Prices).
-    2. For each one, look up which tag (if any) is paired with that SKU.
-    3. Compare the effective price against the last value we actually pushed.
+    1. Read the SKUs this store actually has tags for, from tag_mapping.
+    2. Ask PACMS for just those SKUs (GET /api/Esl/Prices?skus=..., batched).
+    3. Compare each price against the last value actually pushed.
     4. If it really changed, POST /price to the local price-proxy for that tag.
 
 Config is read from the environment (see the *_ constants below). Point
@@ -30,21 +33,15 @@ import tag_mapping
 PACMS_BASE_URL = os.getenv("PACMS_BASE_URL", "http://127.0.0.1:9000").rstrip("/")
 PACMS_API_KEY = os.getenv("PACMS_API_KEY", "dev-mock-key")
 PROXY_BASE_URL = os.getenv("PRICE_PROXY_URL", "http://127.0.0.1:8000").rstrip("/")
-PROXY_TOKEN = os.getenv("PROXY_PUBLIC_TOKEN", "")
-POLL_INTERVAL_SECONDS = int(os.getenv("GATEWAY_POLL_INTERVAL_SECONDS", "300"))
+PROXY_TOKEN = os.getenv("PROXY_PUBLIC_TOKEN") or os.getenv("PUBLIC_API_TOKEN", "")
 REQUEST_TIMEOUT = float(os.getenv("GATEWAY_REQUEST_TIMEOUT", "15"))
+SKU_BATCH_SIZE = int(os.getenv("GATEWAY_SKU_BATCH_SIZE", "100"))
 
 SCHEMA_EXTRA = """
 CREATE TABLE IF NOT EXISTS price_cache (
     sku TEXT PRIMARY KEY,
     effective_price REAL NOT NULL,
-    note TEXT,
     pushed_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS sync_state (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL
 );
 """
 
@@ -60,52 +57,34 @@ def connect():
     return conn
 
 
-def get_since(conn) -> str | None:
-    row = conn.execute("SELECT value FROM sync_state WHERE key = 'last_since'").fetchone()
-    return row[0] if row else None
-
-
-def set_since(conn, value: str) -> None:
-    conn.execute(
-        "INSERT INTO sync_state (key, value) VALUES ('last_since', ?) "
-        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        (value,),
-    )
-    conn.commit()
-
-
 def get_tag_for_sku(conn, sku: str) -> list[str]:
     rows = conn.execute("SELECT tag_mac FROM tag_mapping WHERE sku = ?", (sku,)).fetchall()
     return [row[0] for row in rows]
 
 
-def get_cached(conn, sku: str) -> tuple[float, str] | None:
+def get_cached(conn, sku: str) -> float | None:
     row = conn.execute(
-        "SELECT effective_price, note FROM price_cache WHERE sku = ?", (sku,)
+        "SELECT effective_price FROM price_cache WHERE sku = ?", (sku,)
     ).fetchone()
-    return (row[0], row[1] or "") if row else None
+    return row[0] if row else None
 
 
-def set_cached(conn, sku: str, effective_price: float, note: str) -> None:
+def set_cached(conn, sku: str, effective_price: float) -> None:
     conn.execute(
         """
-        INSERT INTO price_cache (sku, effective_price, note, pushed_at)
-        VALUES (?, ?, ?, ?)
+        INSERT INTO price_cache (sku, effective_price, pushed_at)
+        VALUES (?, ?, ?)
         ON CONFLICT(sku) DO UPDATE SET
             effective_price = excluded.effective_price,
-            note = excluded.note,
             pushed_at = excluded.pushed_at
         """,
-        (sku, effective_price, note, datetime.now(timezone.utc).isoformat(timespec="seconds")),
+        (sku, effective_price, datetime.now(timezone.utc).isoformat(timespec="seconds")),
     )
     conn.commit()
 
 
-def effective_price_and_note(record: dict[str, Any]) -> tuple[float, str]:
-    sale_price = record.get("salePrice")
-    if sale_price is not None:
-        return float(sale_price), "Akcija"
-    return float(record["price"]), ""
+def effective_price(record: dict[str, Any]) -> float:
+    return float(record["price"])
 
 
 def http_get_json(url: str, headers: dict[str, str]) -> Any:
@@ -114,12 +93,14 @@ def http_get_json(url: str, headers: dict[str, str]) -> Any:
         return json.loads(response.read().decode("utf-8"))
 
 
-def fetch_changed_products(since: str | None) -> list[dict[str, Any]]:
-    url = f"{PACMS_BASE_URL}/api/Esl/Prices"
-    if since:
-        url += f"?since={since}"
+def fetch_prices_for_skus(skus: list[str], batch_size: int = SKU_BATCH_SIZE) -> list[dict[str, Any]]:
     headers = {"X-Api-Key": PACMS_API_KEY}
-    return http_get_json(url, headers)
+    products: list[dict[str, Any]] = []
+    for start in range(0, len(skus), batch_size):
+        batch = skus[start : start + batch_size]
+        url = f"{PACMS_BASE_URL}/api/Esl/Prices?skus={','.join(batch)}"
+        products.extend(http_get_json(url, headers))
+    return products
 
 
 _last_push_at = 0.0
@@ -134,14 +115,13 @@ def _throttle() -> None:
     _last_push_at = time.monotonic()
 
 
-def push_price(mac: str, title: str, effective_price: float, note: str) -> None:
+def push_price(mac: str, title: str, price: float) -> bool:
     _throttle()
     payload = {
         "mac": mac,
         "product": title[:60],
-        "price": f"{effective_price:.2f}",
+        "price": f"{price:.2f}",
         "currency": "RSD",
-        "note": note,
     }
     body = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
@@ -157,70 +137,77 @@ def push_price(mac: str, title: str, effective_price: float, note: str) -> None:
         with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as response:
             response.read()
             log(f"  -> pushed {mac}: {payload['product']} {payload['price']} RSD ({response.status})")
+            return True
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", "replace")
         log(f"  -> FAILED {mac}: HTTP {exc.code} {body}")
+        return False
     except urllib.error.URLError as exc:
         log(f"  -> FAILED {mac}: cannot reach proxy ({exc.reason})")
+        return False
 
 
-def sync_once(conn) -> int:
-    since = get_since(conn)
-    log(f"pulling prices since={since or '(all)'}")
+def sync_once(conn) -> dict[str, Any]:
+    skus = tag_mapping.get_mapped_skus(conn)
+    if not skus:
+        return {"skus_mapped": 0, "checked": 0, "pushed": 0, "unchanged": 0, "failed": 0}
+
+    log(f"syncing {len(skus)} mapped SKU(s)")
     try:
-        products = fetch_changed_products(since)
+        products = fetch_prices_for_skus(skus)
     except (urllib.error.URLError, json.JSONDecodeError) as exc:
         log(f"failed to fetch prices from PACMS: {exc}")
-        return 0
+        return {"ok": False, "error": str(exc)}
 
     pushed = 0
-    latest_modified = since
+    unchanged = 0
+    failed = 0
     for record in products:
         sku = record["sku"]
-        modified_at = record.get("modifiedAt")
-        if modified_at and (latest_modified is None or modified_at > latest_modified):
-            latest_modified = modified_at
-
-        effective_price, note = effective_price_and_note(record)
+        price = effective_price(record)
         cached = get_cached(conn, sku)
-        if cached is not None and cached == (effective_price, note):
-            continue  # ModifiedAt moved but the price itself didn't -- nothing to do
+        if cached is not None and cached == price:
+            unchanged += 1
+            continue
 
         tag_macs = get_tag_for_sku(conn, sku)
         if not tag_macs:
-            set_cached(conn, sku, effective_price, note)
+            set_cached(conn, sku, price)
             continue
 
-        log(f"price change for {sku}: {effective_price:.2f} RSD{' (Akcija)' if note else ''}")
+        log(f"price change for {sku}: {price:.2f} RSD")
+        all_ok = True
         for mac in tag_macs:
-            push_price(mac, record.get("title", sku), effective_price, note)
-            pushed += 1
-        set_cached(conn, sku, effective_price, note)
+            ok = push_price(mac, record.get("title", sku), price)
+            if ok:
+                pushed += 1
+            else:
+                failed += 1
+                all_ok = False
+        if all_ok:
+            set_cached(conn, sku, price)
 
-    if latest_modified:
-        set_since(conn, latest_modified)
-    return pushed
+    return {
+        "skus_mapped": len(skus),
+        "checked": len(products),
+        "pushed": pushed,
+        "unchanged": unchanged,
+        "failed": failed,
+    }
 
 
 def require_config() -> None:
     if not PROXY_TOKEN:
-        raise RuntimeError("PROXY_PUBLIC_TOKEN environment variable is required")
+        raise RuntimeError("PROXY_PUBLIC_TOKEN (or PUBLIC_API_TOKEN) environment variable is required")
 
 
 def main() -> None:
     require_config()
-    once = "--once" in sys.argv
     conn = connect()
     try:
-        if once:
-            pushed = sync_once(conn)
-            log(f"done, {pushed} tag update(s) pushed")
-            return
-        log(f"gateway loop starting, polling every {POLL_INTERVAL_SECONDS}s")
-        while True:
-            pushed = sync_once(conn)
-            log(f"cycle done, {pushed} tag update(s) pushed")
-            time.sleep(POLL_INTERVAL_SECONDS)
+        summary = sync_once(conn)
+        log(f"done: {summary}")
+        print(json.dumps(summary))
     finally:
         conn.close()
 

@@ -113,6 +113,8 @@ The Pi proxy files are:
 
 ```text
 tools/raspberry_price_proxy.py
+tools/gateway.py
+tools/tag_mapping.py
 tools/price-proxy.service
 tools/price-proxy.env.example
 ```
@@ -121,9 +123,14 @@ Installed target paths:
 
 ```text
 /opt/price-proxy/app.py
+/opt/price-proxy/gateway.py
+/opt/price-proxy/tag_mapping.py
 /etc/price-proxy.env
 /etc/systemd/system/price-proxy.service
 ```
+
+`gateway.py` and `tag_mapping.py` must sit next to `app.py` on the Pi so
+`import gateway` / `import tag_mapping` resolve.
 
 Example environment:
 
@@ -134,9 +141,53 @@ ESP_BASE_URL=http://ESP_IP:8080
 PUBLIC_API_TOKEN=replace-with-random-public-token
 ESP_API_TOKEN=replace-with-esp-token
 ESP_FORWARD_TIMEOUT=15
+PACMS_BASE_URL=http://PACMS_HOST:PORT
+PACMS_API_KEY=replace-with-pacms-key
 ```
 
+`PROXY_PUBLIC_TOKEN` is only needed if the gateway's internal call back to
+this same proxy should use a different token than `PUBLIC_API_TOKEN`; if
+unset, it falls back to `PUBLIC_API_TOKEN` automatically.
+
 Do not commit `/etc/price-proxy.env` or real token values.
+
+### `POST /sync-now`
+
+Requires the same bearer token as `/price`. No request body. Reads this
+store's SKUs from the local `tag_mapping` table, asks PACMS for just those
+(batched), and pushes only the prices that actually changed since the last
+sync.
+
+```text
+POST http://localhost:8000/sync-now
+Authorization: Bearer YOUR_PUBLIC_TOKEN
+```
+
+Response:
+
+```json
+{
+  "ok": true,
+  "skus_mapped": 400,
+  "checked": 400,
+  "pushed": 2,
+  "unchanged": 398,
+  "failed": 0
+}
+```
+
+If a sync is already running, a second call returns HTTP `409` with
+`{"ok": false, "error": "sync already in progress"}`.
+
+There is no automatic/background sync loop -- prices only reach tags when
+`/sync-now` is called.
+
+For a bulk price update touching many tags at once, prefer calling
+`/sync-now` from an SSH session directly against `http://127.0.0.1:8000`
+rather than through the Cloudflare Quick Tunnel. The ESP32 API accepts at
+most one price push per second, so a large batch can take several minutes;
+the tunnel's own request timeout may be shorter than that even though the
+sync keeps running correctly in the background.
 
 ## Cloudflare Quick Tunnel on the Raspberry Pi
 
