@@ -107,6 +107,56 @@ and filesystem endpoints, but it cannot provide confidentiality or transport
 integrity. Use a long random token, rotate it if exposed, and restrict source
 IPs on the router when possible.
 
+## Central product database
+
+`tools/central_db.py` is the store-agnostic catalog every store's Pi pulls
+prices from. It is SQLite-backed, so the data survives a restart, and it
+replaces the earlier in-memory `mock_pacms.py`.
+
+Run it on the host that holds the catalog -- deliberately not on the Pi, so
+the Pi exercises a real network path:
+
+```bash
+python tools/central_db.py --seed   # first run: creates and fills the catalog
+python tools/central_db.py          # afterwards
+```
+
+Environment:
+
+```text
+CENTRAL_DB_LISTEN=0.0.0.0
+CENTRAL_DB_PORT=9000
+CENTRAL_DB_API_KEY=replace-with-central-db-key
+CENTRAL_DB_PATH=tools/central.db
+```
+
+The `products` table holds `id`, `sku` (unique), `barcode`, `title`, `price`,
+`sale_price`, `stock` (quantity), and `modified_at`. `modified_at` is set
+automatically on every edit. The seed catalog contains 100 hardware-store
+products.
+
+Endpoints (all except `GET /` require `X-Api-Key`):
+
+```text
+GET  /                              worker UI
+GET  /health
+GET  /api/Esl/Prices?skus=a,b,c     what gateway.py calls
+GET  /api/Esl/Prices?since=<ISO8601>&page=<int>&size=<int>
+POST /api/Esl/Products/<sku>        {"price":…, "salePrice":…, "stock":…}
+```
+
+`GET /` serves a small page a shop worker can use to change a price or stock
+count. The page itself loads without a key; it asks for the key once, keeps it
+in `sessionStorage`, and sends it as a header on every data call, so the key is
+never baked into the served HTML. Treat this UI the same as the S3 admin port:
+keep it on the local network, do not expose it publicly.
+
+A sale price is only reported when it is a genuine discount -- a `salePrice`
+that is zero, negative, or not below `price` is returned as `null`.
+
+`gateway.py` needs no changes to work against this service; the HTTP contract
+is the same one it was written for.
+
 ## Raspberry Pi proxy
 
 The Pi proxy files are:
