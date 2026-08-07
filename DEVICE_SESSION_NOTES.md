@@ -524,3 +524,115 @@ recovery can take several minutes and shouldn't be judged as failed
 immediately — next session should re-check `/get_db` for a `lastseen` close
 to current time to confirm a real tag round-trip end-to-end, not just a
 healthy `apstate`.
+
+## 2026-08-07
+
+End-to-end price delivery was visually confirmed on real tags for the first
+time: `POST /price` -> S3 -> C6 -> 802.15.4 radio -> e-ink display. Two tags
+showed the pushed test price. This closes the open item from the 2026-08-05
+entry above (a fresh `lastseen` / real tag round-trip, not just a healthy
+`apstate`).
+
+Getting there required fixing four independent problems, listed in the order
+they were found.
+
+### 1. S3 was unreachable because of a stale static IP
+
+`GET /get_ap_config` could not be reached on any known address. Scanning the
+home subnet found no Espressif device and no host with ports 80/8080 open.
+
+Root cause: the S3 had Wi-Fi settings saved from the July phone-hotspot setup
+(`192.168.31.x`, see the 2026-07-08 entry), including a static IP. It was
+associating with the home router (`192.168.0.x`) successfully but assigning
+itself an address from a subnet that does not exist there, so it was invisible.
+Because the association *succeeded*, `startManagementServer()`
+(`wifimanager.cpp:258-273`) never ran, so the `OpenEPaperLink` fallback config
+AP never appeared either — which is what made this look like a dead board.
+
+Fix: hold the BOOT button (GPIO0) for 5+ seconds while the firmware is running.
+`wifimanager.cpp:103-131` polls GPIO0 and clears the saved ssid/pw/ip/mask/gw/
+dns, then reboots. The `OpenEPaperLink` config AP then appears at
+`http://192.168.4.1/setup`. Re-entered the home 2.4GHz SSID with **no** static
+IP. The S3 is now at `192.168.0.34` (MAC `ac:a7:04:26:a2:ac`).
+
+Note for future debugging: the S3 splits its console across two ports.
+`ARDUINO_USB_CDC_ON_BOOT` is defined for `ESP32_S3_SIMPLE_AP`
+(`platformio.ini`), so `Serial` is the **native USB port**, while the "COM"
+connector (the USB-serial bridge, COM16 here) only carries raw `printf()`
+output. `serialap.cpp` uses `#define LOG(...) printf(...)`, everything else
+uses `Serial.*`. That is why COM16 shows only `rxSerialTask starting`, ROM boot
+banners and panic dumps, and none of the Wi-Fi/IP logs — the console looks dead
+when it is not.
+
+### 2. AP_STATE_FAILED deadlock (fixed in code)
+
+If the C6 was not ready when the S3 booted, `apInfo.state` went to
+`AP_STATE_FAILED`. The recovery loop in `APTask` only pings the C6 when the
+link has been **idle** for 30 seconds:
+
+```cpp
+if (((state == AP_STATE_ONLINE) || (state == AP_STATE_FAILED)) &&
+    (millis() - lastAPActivity > AP_ACTIVITY_MAX_INTERVAL))
+```
+
+But `lastAPActivity` is refreshed on every tag transmission
+(`serialap.cpp:533, 543, 567`). With tags checking in regularly the idle
+condition never became true, `sendPing()` never ran, and the state stayed
+`FAILED` forever. The AP was stuck *because* it was busy.
+
+That state also gates content generation — `main.cpp:199` only calls
+`contentRunner()` when the state is `ONLINE` or `NORADIO` — so nothing was ever
+sent to the tags.
+
+Fix (`serialap.cpp`, `APTask` watchdog loop): recent AP activity is itself
+proof the link works, so recover from `FAILED` directly instead of waiting for
+an idle window that never comes.
+
+### 3. The 2 Mbaud UART upgrade (fixed in code)
+
+After a successful handshake **at 115200**, `bringAPOnline()` sent `HSPD` and
+switched both sides to 2,000,000 baud (`serialap.cpp:887-893`; the C6 side is
+`main/main.c:291-295`). The handshake therefore always succeeded and `apstate`
+briefly reached `1`, then the link died immediately after the switch, the
+watchdog dropped it offline, and the retry re-connected at 115200 — an endless
+flap. This matched the observed behaviour exactly: `apstate` oscillating
+between `1` and `0`/`5` every 30-60 seconds.
+
+Fix: added `-D AP_UART_STAY_115200` to the `ESP32_S3_SIMPLE_AP` env and guarded
+the highspeed switch with it. Slower image transfers, stable link.
+
+### 4. Wiring quality (fixed in hardware)
+
+Disabling the 2 Mbaud switch improved things — `apstate` then held `1` for
+40-60 second stretches instead of dropping instantly — but it still flapped.
+Moving the S3<->C6 connection from loose dupont jumper wires onto a
+**protoboard** eliminated the remaining instability completely: `apstate` held
+`1` across 25 consecutive polls over ~3 minutes with zero drops, and tags
+resumed checking in.
+
+Both fixes were needed. The 2 Mbaud switch made even good wiring marginal; the
+dupont wiring made even 115200 marginal.
+
+### Observed side effects while the link was flapping
+
+- `pending` climbed (1 -> 6) on a single tag: every successful reconnect calls
+  `refreshAllPending()`, re-queueing the same payload.
+- Those queued items eventually expired (`pending` back to 0) without being
+  delivered.
+- `lastseen` stretched from ~15 minutes to ~3 hours: tags that repeatedly fail
+  to complete a check-in back off to save battery. After the link was fixed the
+  tags returned on their own, without needing a manual reset.
+
+### Raspberry Pi
+
+The Pi was found at `192.168.0.35` (MAC `b8:27:eb:76:24:aa`) after connecting
+it to the router by Ethernet; its saved Wi-Fi is still the old July hotspot, so
+it does not join the home network on its own yet. `/etc/price-proxy.env` still
+had `ESP_BASE_URL=http://192.168.31.203:8080` (the stale hotspot address) —
+updated to `http://192.168.0.34:8080` and `price-proxy` restarted.
+
+### Still open
+
+- Add the home Wi-Fi to the Pi so it does not need the Ethernet cable.
+- Make a DHCP reservation for the S3 (`ac:a7:04:26:a2:ac`) so its address stops
+  moving; `PRICE_API.md` still refers to `192.168.0.24` from an earlier session.

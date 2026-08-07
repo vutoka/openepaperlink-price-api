@@ -884,6 +884,7 @@ bool bringAPOnline(uint8_t newState) {
             setAPstate(false, AP_STATE_OFFLINE);
             return false;
         }
+#ifndef AP_UART_STAY_115200
         if (apInfo.type == ESP32_C6) {
             if (sendHighspeed()) {
                 AP_SERIAL_PORT.flush();
@@ -892,6 +893,12 @@ bool bringAPOnline(uint8_t newState) {
                 Serial.println("switched to 2000000 baud");
             }
         }
+#else
+        // 2 Mbaud is unreliable over jumper wires between separate boards: the handshake
+        // succeeds at 115200, then the link dies right after the switch and the watchdog
+        // drops the AP back offline, over and over. Slower but stable wins here.
+        Serial.println("staying at 115200 baud (AP_UART_STAY_115200)");
+#endif
 
         vTaskDelay(200 / portTICK_PERIOD_MS);
         setAPstate(newState == AP_STATE_ONLINE ? true : false, newState);
@@ -1092,6 +1099,15 @@ void APTask(void* parameter) {
 
     uint8_t attempts = 0;
     while (1) {
+        // Recent traffic from the AP radio proves the link works, even if we failed to reach it at boot.
+        // Without this, a busy AP never satisfies the idle condition below, so it stays FAILED forever
+        // and contentRunner() is never allowed to run.
+        if (apInfo.state == AP_STATE_FAILED && lastAPActivity != 0 && millis() - lastAPActivity < AP_ACTIVITY_MAX_INTERVAL) {
+            LOG("AP radio is active again, recovering from failed state\n");
+            setAPstate(true, AP_STATE_ONLINE);
+            attempts = 0;
+            refreshAllPending();
+        }
         if (((apInfo.state == AP_STATE_ONLINE) || (apInfo.state == AP_STATE_FAILED)) && (millis() - lastAPActivity > AP_ACTIVITY_MAX_INTERVAL)) {
             bool reply = sendPing();
             if (!reply) {
