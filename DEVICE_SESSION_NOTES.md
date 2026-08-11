@@ -636,3 +636,78 @@ updated to `http://192.168.0.34:8080` and `price-proxy` restarted.
 - Add the home Wi-Fi to the Pi so it does not need the Ethernet cable.
 - Make a DHCP reservation for the S3 (`ac:a7:04:26:a2:ac`) so its address stops
   moving; `PRICE_API.md` still refers to `192.168.0.24` from an earlier session.
+
+## 2026-08-11
+
+The central product database (`tools/central_db.py`, 100 products) was tested
+against real hardware for the first time. One tag received and displayed its
+price through the full chain — central DB on the laptop -> Pi -> S3 -> C6 ->
+radio -> e-ink. Two tags did not, and that is the open item below.
+
+### Network as found this session
+
+The S3 came back on `192.168.0.34` with `apstate: 1` straight after power-on,
+so the 2026-08-07 firmware fixes hold across a power cycle. The Pi auto-joined
+the home WiFi on `192.168.0.40` with the Ethernet cable unplugged, confirming
+the NetworkManager profile added last session works. `PACMS_BASE_URL` on the Pi
+was pointed at the laptop (`http://192.168.0.30:9000`) so the Pi exercises a
+real network path to the catalog rather than localhost; Windows Firewall did
+not block it.
+
+`/sync-now` against the real catalog returned
+`{"skus_mapped": 3, "checked": 3, "pushed": 3, "failed": 0}`, and an immediate
+re-run returned `pushed: 0, unchanged: 3`, so the SKU-scoped fetch and the
+`price_cache` diff both behave correctly against the new database.
+
+### Tag wake-up behaviour
+
+`resources/tagtypes/11.json` lists `"options": [ "button" ]` for hwType 17, but
+these physical tags have **no button**. Battery removal is the only manual
+wake, and it only helps if the replacement cell is charged — two tags were
+simply flat. Note that `batteryMv` in `/get_db` is only refreshed when a tag
+checks in, so a stale `3000` on a silent tag says nothing about its current
+charge; the last-seen timestamp has to be read alongside it.
+
+Two config values are relevant here and neither was changed yet:
+
+- `maxsleep` is `0`. In `contentmanager.cpp:76-90` that clamps
+  `minutesUntilNextUpdate` to zero, the `> 1` guard fails, and
+  `prepareIdleReq()` is never called — so the AP never tells a tag when to
+  come back and the tag falls back to its own firmware interval. It also makes
+  `tag_db.cpp:284` flag a tag as timed out after only 5 minutes. Setting it to
+  ~10 was proposed.
+- `stopsleep` is already `1`, so while the AP web UI is open in a browser
+  `newproto.cpp:166` tells tags not to sleep at all. Worth having the UI open
+  during any test session.
+
+### Open: two tags check in but never receive their image
+
+All three tags now check in every ~30 seconds, but two keep `pending = 1`
+indefinitely and their screens stay on the tag firmware's own "waiting for
+data" message (that string is not in the AP firmware).
+
+Content generation is not the problem — `/current/<MAC>.json`, `.raw` and
+`<MAC>_<millis>.pending` all exist on the S3 for the stuck tags, while the tag
+that succeeded has no `.pending` file left. The failure is in the radio block
+transfer itself.
+
+Leading hypothesis, and it may be self-inflicted: `AP_UART_STAY_115200` (added
+2026-08-07 to stop the link flapping) makes each 4096-byte block
+(`BLOCK_DATA_SIZE`, `proto.h:147`) take roughly 0.36s over UART instead of
+0.02s at 2 Mbaud. If the tag times out waiting for a block after requesting
+it, that extra latency would break the transfer. Against the hypothesis: one
+tag did complete a transfer on this same firmware, which suggests marginal
+timing rather than an outright break.
+
+Next step is to read the AP web UI's log panel while a stuck tag checks in.
+These two lines go through `wsLog` and so appear there, unlike the
+`Serial.printf` diagnostics which go to the S3's native USB port rather than
+the COM connector:
+
+- `... block request <file> block N, len L checksum C` (`newproto.cpp:419`)
+- `... reports xfer complete` (`newproto.cpp:429`)
+
+No block-request lines means the failure is before the transfer starts. Block
+requests without an xfer complete would confirm the baud hypothesis, in which
+case the options are an intermediate baud rate (460800 rather than 2000000) or
+a smaller block size.
