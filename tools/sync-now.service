@@ -1,0 +1,18 @@
+[Unit]
+# One price sync, triggered by sync-now.timer.
+#
+# This is the pull side of the system: the Pi asks the catalog what the prices
+# are. Nothing ever calls into the store. The endpoint it hits is bound to
+# 127.0.0.1, so this trigger is local even though it speaks HTTP.
+Description=Trigger one ESL price sync
+After=network-online.target price-proxy.service
+Requires=price-proxy.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/price-proxy.env
+ExecStart=/usr/bin/curl -sS --max-time 90 -X POST \
+    -H "Authorization: Bearer ${PUBLIC_API_TOKEN}" \
+    http://127.0.0.1:8000/sync-now
+# curl writes the result JSON to stdout, so `journalctl -u sync-now` shows
+# pushed/unchanged/failed counts for every run.

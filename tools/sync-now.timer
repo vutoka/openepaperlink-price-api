@@ -1,0 +1,24 @@
+[Unit]
+Description=ESL price sync schedule
+
+[Timer]
+# DEVELOPMENT cadence. 60s so a price edited in the catalog UI reaches the
+# shelf while you are still standing in front of it.
+#
+# For PRODUCTION, replace the two lines below with a single morning pull:
+#
+#     OnCalendar=*-*-* 06:00:00
+#     Persistent=true
+#
+# `Persistent=true` matters: if the Pi was off at 06:00 it runs the sync as
+# soon as it boots, so a store that lost power overnight still opens with
+# correct prices. Nothing else in the chain needs to change -- the gateway
+# already compares against price_cache, so a once-daily pull sends exactly
+# the prices that actually moved.
+OnBootSec=90
+OnUnitActiveSec=60
+AccuracySec=5s
+Unit=sync-now.service
+
+[Install]
+WantedBy=timers.target
