@@ -711,3 +711,98 @@ No block-request lines means the failure is before the transfer starts. Block
 requests without an xfer complete would confirm the baud hypothesis, in which
 case the options are an intermediate baud rate (460800 rather than 2000000) or
 a smaller block size.
+
+## 2026-08-12
+
+Session goal: work out why tags are so hard to bring back after they have been
+powered off. Answer found, and it is not a bug in anything we wrote.
+
+### Root cause: the tag's own scan backoff
+
+The tags are hwType `0x11` (M2 2.9"), which is a ZBS243 part. That firmware is
+not in this repo; it lives in `OpenEPaperLink/Tag_FW_ZBS243`. From
+`tag_fw/powermgt.h`:
+
+    #define INTERVAL_1_TIME     3600UL   // Try every hour
+    #define INTERVAL_1_ATTEMPTS 24       // for 24 attempts (an entire day)
+    #define INTERVAL_2_TIME     7200UL   // Try every 2 hours
+    #define INTERVAL_2_ATTEMPTS 12       // for 12 attempts (an additional day)
+    #define INTERVAL_3_TIME     86400UL  // Finally, try every day
+
+A tag that boots and does not find an AP sleeps 2 minutes
+(`tag_fw/main.c:889`), then enters `TagChanSearch`, which sleeps
+`getNextScanSleep()` after every failed scan (`tag_fw/main.c:492`). So the
+retry ladder is one hour for a day, two hours for another day, then once a day
+forever. Nothing external can shorten it, because the radio is off.
+
+Practical rule: **power the AP up and confirm `apstate: 1` before the tags get
+power.** A tag that misses its boot scan costs an hour minimum.
+
+This also explains the older observation that only one of three tags comes
+back after a power cycle: whichever tag happens to scan while the AP is
+answering associates, and the others fall into the ladder.
+
+### Why "wake the tags on demand" cannot work here
+
+`enableRFWake` in `tagsettings` is real: it leaves the ZBS243 carrier detector
+powered during sleep (`tag_fw/powermgt.c:332`, `RADIO_RadioPowerCtl &= 0xFB`)
+so RF energy raises `WAKEUP_REASON_RF`. Costs about 0.9µA
+(`oepl-proto.h:160`). It is exposed in the AP web UI under Set Tag Config
+(`wwwroot/content_cards.json:681`).
+
+But the C6 AP never transmits unless spoken to. Every `radioTx` in
+`ARM_Tag_FW/OpenEPaperLink_esp32_C6_AP/main/main.c` sits in a reply path
+(`sendPart`, `sendXferCompleteAck`, `sendCancelXfer`, `sendPong`,
+`processTagReturnData`), each doing `memcpy(txHeader->dst, rxHeader->src, 8)`,
+and the main loop at `main.c:789` is receive-only. There is no beacon.
+
+So RF wake gives a herd effect only: once one tag talks, the AP's replies put
+energy on the channel and can wake neighbours that have the flag set. It is
+not a remote wake switch. Building one would mean adding deliberate
+transmission on the AP side.
+
+For reference, commercial systems dodge the problem rather than solve it:
+infrastructure runs 24/7 so tags never enter a backoff, Bluetooth 5.4 PAwR
+gives each tag a scheduled slot, and Pricer uses infrared, where an always-on
+photodiode is cheap enough to leave listening.
+
+### Two gotchas found while reading the AP code
+
+`/save_cfg` does not persist. The `saveDB` call at `web.cpp:568` is commented
+out, so a queued tag config lives in RAM only and is lost if the AP reboots.
+Hit this for real today: config was queued, the S3 rebooted, and all three
+tags silently reverted to `contentMode 19`.
+
+`lastseen` can move backwards after a config push. `popTagInfo`
+(`tag_db.cpp:526`) restores the snapshot that `pushTagInfo` took when the mode
+was changed, so post-transfer the record carries the *old* `lastseen`,
+`pending` and `updatecount`. Do not read a stale `lastseen` as proof that a
+tag never checked in.
+
+### State at end of session
+
+S3 `192.168.0.34` (`apstate: 1`, stable, uptime climbing normally), Pi
+`192.168.0.40` with `price-proxy` active, central DB running on the laptop
+with 100 products. Addresses unchanged from 2026-08-11.
+
+- `00000181500F3B39` — recovered after a battery reseat. Checks in every ~30s,
+  accepted the RF wake config (`contentMode` 18 -> 19), `updatecount` 15.
+- `000001811E293B37` — still asleep in the ladder, config queued.
+- `0000018152583B39` — still asleep, and `batteryMv` reads 2100, below the
+  `BATTERY_VOLTAGE_MINIMUM` of 2450. Flat cell; it was the tag that did all
+  the work on 2026-08-11 (`updatecount` 23). Needs a new battery.
+
+Note that the two tags left stuck at `pending = 1` on 2026-08-11 were all at
+`pending = 0` when this session opened, so those transfers did complete on
+their own afterwards. The block-transfer worry from that session is therefore
+weaker than it looked, though not formally closed.
+
+### Next session
+
+1. Reseat the battery on `000001811E293B37` and fit a fresh cell in
+   `0000018152583B39`, with the AP already up.
+2. Confirm each one picks up the queued RF wake config, then re-queue it if
+   the AP has rebooted in the meantime.
+3. Run `/sync-now` and confirm prices from the central DB reach all three.
+4. Optional and still not applied: `maxsleep` is `0`. Setting it to ~10 bounds
+   how long an *associated* tag sleeps. Separate from the scan ladder above.
