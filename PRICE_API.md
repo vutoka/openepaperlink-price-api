@@ -131,9 +131,14 @@ CENTRAL_DB_PATH=tools/central.db
 ```
 
 The `products` table holds `id`, `sku` (unique), `barcode`, `title`, `price`,
-`sale_price`, `stock` (quantity), and `modified_at`. `modified_at` is set
-automatically on every edit. The seed catalog contains 100 hardware-store
-products.
+`stock` (quantity), and `modified_at`. `modified_at` is set automatically on
+every edit. The seed catalog contains 100 hardware-store products.
+
+A product carries **one** price: the number to print on the shelf. Resolving
+promotions is the catalog's job, so the ESL system is never handed two figures
+and asked to choose. (`products.sale_price` still exists in the schema so
+already-seeded databases open, but nothing reads it and the API does not
+expose it.)
 
 Endpoints (all except `GET /` require `X-Api-Key`):
 
@@ -142,7 +147,9 @@ GET  /                              worker UI
 GET  /health
 GET  /api/Esl/Prices?skus=a,b,c     what gateway.py calls
 GET  /api/Esl/Prices?since=<ISO8601>&page=<int>&size=<int>
-POST /api/Esl/Products/<sku>        {"price":…, "salePrice":…, "stock":…}
+POST /api/Esl/Products/<sku>        {"price":…, "stock":…}
+POST /api/Esl/ShelfStatus           a store reports what its shelves show
+GET  /api/Esl/ShelfStatus           read those reports back
 ```
 
 `GET /` serves a small page a shop worker can use to change a price or stock
@@ -151,11 +158,25 @@ in `sessionStorage`, and sends it as a header on every data call, so the key is
 never baked into the served HTML. Treat this UI the same as the S3 admin port:
 keep it on the local network, do not expose it publicly.
 
-A sale price is only reported when it is a genuine discount -- a `salePrice`
-that is zero, negative, or not below `price` is returned as `null`.
-
 `gateway.py` needs no changes to work against this service; the HTTP contract
 is the same one it was written for.
+
+### Shelf status
+
+The worker page has a **Polica** column showing what each price actually did:
+
+| Pill | Meaning |
+|---|---|
+| `na polici` (green) | confirmed -- the glass shows this price |
+| `salje se` (yellow) | sent, waiting for the tag to wake and take it |
+| `NIJE STIGLO` (red) | retried to exhaustion; the shelf shows the old price |
+| `nema taga` (grey) | priced, but nothing is mapped to display it |
+
+Each store posts this after every sync. The post is **outbound** -- the
+catalog never calls into a store -- and it carries that store's complete
+picture, so shelves the report no longer mentions are deleted rather than left
+showing a stale red. Without that, a retired tag would sit red forever and the
+colour would stop meaning anything.
 
 ## Raspberry Pi proxy
 
@@ -222,15 +243,86 @@ Response:
   "checked": 400,
   "pushed": 2,
   "unchanged": 398,
-  "failed": 0
+  "failed": 0,
+  "confirmed": 1,
+  "resent": 0,
+  "undelivered": 0,
+  "in_flight": 2
 }
 ```
 
 If a sync is already running, a second call returns HTTP `409` with
 `{"ok": false, "error": "sync already in progress"}`.
 
-There is no automatic/background sync loop -- prices only reach tags when
-`/sync-now` is called.
+`/sync-now` is called by `sync-now.timer` (see below), not by an internal
+loop -- prices only move when something triggers a sync.
+
+### Delivery is confirmed, not assumed
+
+A `202` from the AP means *queued*, not *displayed*. A tag that is out of range
+or flat when its price is pushed will never show it, so treating the 202 as
+success would cache the new price and never retry: the shelf would be wrong,
+silently and permanently.
+
+So the gateway tracks two stages:
+
+| Table | Meaning |
+|---|---|
+| `delivery` | pushed to the AP, not yet seen on the tag |
+| `price_cache` | **confirmed on the tag** -- what the shelf really shows |
+
+Only `price_cache` is compared against PACMS, and only a confirmed price gets
+written to it. Confirmation reads the AP's own database
+(`GET /get_db` on `AP_WEB_URL`) and requires all three of:
+
+* the tag is no longer marked `pending`
+* its `updatecount` has increased since the push
+* the content the AP rendered for it carries the price we sent
+
+Anything unconfirmed is re-sent after `DELIVERY_RETRY_AFTER_SECONDS`, up to
+`DELIVERY_MAX_ATTEMPTS`, then reported as `undelivered` -- red in the worker
+UI -- rather than forgotten. Pushes the AP *refuses* (wrong `hwType`, proxy
+down) are recorded the same way, so a price that can never be delivered ends
+up visibly red instead of sitting in "sending" forever.
+
+Extra environment for this:
+
+```text
+AP_WEB_URL=http://192.168.0.34            # AP's plain web port, where /get_db lives
+STATUS_REPORT_URL=http://192.168.0.30:9000  # catalog to report shelf status to
+STORE_ID=default                          # which store this Pi is
+DELIVERY_RETRY_AFTER_SECONDS=900
+DELIVERY_MAX_ATTEMPTS=5
+```
+
+`python3 gateway.py status` prints the current per-shelf state without
+syncing.
+
+### `sync-now.timer`
+
+`tools/sync-now.service` and `tools/sync-now.timer` make the Pi trigger its own
+sync, so nothing has to call into the store: no domain, no tunnel, no open
+port. A sync missed while the Pi was down is picked up on the next run instead
+of being lost -- which is exactly why this is a pull and not a webhook.
+
+```bash
+sudo install -m 644 tools/sync-now.service tools/sync-now.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now sync-now.timer
+systemctl list-timers sync-now
+journalctl -u sync-now -f      # one JSON summary per run
+```
+
+Development cadence is `OnUnitActiveSec=60`. For production, swap it for a
+single morning pull:
+
+```ini
+OnCalendar=*-*-* 06:00:00
+Persistent=true
+```
+
+`Persistent=true` matters -- a store that lost power overnight then syncs on
+boot instead of opening with yesterday's prices.
 
 For a bulk price update touching many tags at once, prefer calling
 `/sync-now` from an SSH session directly against `http://127.0.0.1:8000`

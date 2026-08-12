@@ -6,12 +6,22 @@ prices from. It replaces the earlier in-memory `mock_pacms.py`: the data now
 lives in SQLite and survives a restart, and there is a small web UI a shop
 worker can use to change a price or a stock count.
 
-The HTTP contract is unchanged, so `gateway.py` needs no modification:
+Endpoints:
 
     GET  /api/Esl/Prices?skus=<sku1>,<sku2>,...
     GET  /api/Esl/Prices?since=<ISO8601>&page=<int>&size=<int>
-    POST /api/Esl/Products/<sku>          -- worker edits price/salePrice/stock
+    POST /api/Esl/Products/<sku>          -- worker edits price/stock
+    POST /api/Esl/ShelfStatus             -- a store reports what its shelves show
+    GET  /api/Esl/ShelfStatus             -- read those reports back
     GET  /health
+
+A product carries **one** price: the number to print on the shelf. Resolving
+promotions is the catalog's job, not the ESL system's, so there is no separate
+sale price to choose between.
+
+`ShelfStatus` is what makes an undelivered price visible. The store posts it
+after every sync -- outbound, so nothing ever calls into the store -- and the
+worker page colours a row red when a price it set never reached the glass.
 
 Machine access authenticates with a shared `X-Api-Key` header, the same way
 PACMS API keys work. The worker UI at `/` asks for that key once and keeps it
@@ -55,7 +65,29 @@ CREATE TABLE IF NOT EXISTS products (
     modified_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_products_modified_at ON products (modified_at);
+
+-- What each store reports back about its shelves. Written by POST
+-- /api/Esl/ShelfStatus, read by the worker page so a price that never reached
+-- the glass shows up red instead of being assumed good.
+CREATE TABLE IF NOT EXISTS shelf_status (
+    sku          TEXT NOT NULL,
+    tag_mac      TEXT NOT NULL DEFAULT '',
+    store        TEXT NOT NULL DEFAULT 'default',
+    state        TEXT NOT NULL,
+    wanted_price REAL,
+    shelf_price  REAL,
+    attempts     INTEGER NOT NULL DEFAULT 0,
+    detail       TEXT,
+    reported_at  TEXT NOT NULL,
+    PRIMARY KEY (sku, tag_mac)
+);
 """
+
+# `products.sale_price` is vestigial. An earlier version of this mock modelled
+# a separate promotional price, but the real catalog resolves promotions itself
+# and hands the ESL system one number: the price to print on the shelf. The
+# column is left in place so existing seeded databases still open; nothing
+# reads it and the API does not expose it.
 
 
 def now_iso() -> str:
@@ -70,6 +102,11 @@ def connect() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
+    try:
+        conn.execute("ALTER TABLE shelf_status ADD COLUMN store TEXT NOT NULL DEFAULT 'default'")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # already there
     return conn
 
 
@@ -224,21 +261,19 @@ def seed(conn: sqlite3.Connection) -> int:
     return inserted
 
 
-def sanitized_sale_price(price: float, sale_price: float | None) -> float | None:
-    """A sale price only counts if it is a real discount."""
-    if sale_price is None or sale_price <= 0 or sale_price >= price:
-        return None
-    return sale_price
-
-
 def serialize(row: sqlite3.Row) -> dict[str, Any]:
+    """One product, exactly as the ESL system is expected to receive it.
+
+    `price` is the number that goes on the shelf, already resolved -- the
+    catalog decides whether that is a regular or a promotional price, and the
+    ESL system never has to choose between two figures.
+    """
     return {
         "id": row["id"],
         "sku": row["sku"],
         "barcode": row["barcode"],
         "title": row["title"],
         "price": row["price"],
-        "salePrice": sanitized_sale_price(row["price"], row["sale_price"]),
         "stock": row["stock"],
         "modifiedAt": row["modified_at"],
     }
@@ -273,6 +308,22 @@ WORKER_PAGE = """<!doctype html>
   tr.saved { background: #22c55e22; }
   tr.failed { background: #ef444422; }
   #msg { margin-left: auto; opacity: .75; }
+
+  /* Shelf state, as reported by the store. The point of this column is that a
+     price which never reached the glass is visible, not assumed. */
+  .pill { display: inline-block; padding: .1rem .5rem; border-radius: 999px;
+          font-size: .8rem; white-space: nowrap; }
+  .pill.on_shelf    { background: #22c55e33; color: #15803d; }
+  .pill.in_flight   { background: #eab30833; color: #a16207; }
+  .pill.undelivered { background: #ef444433; color: #b91c1c; font-weight: 600; }
+  .pill.no_tag      { background: #8881; opacity: .8; }
+  .pill.unknown     { background: #8881; opacity: .6; }
+  tr.alert { background: #ef44441a; }
+  @media (prefers-color-scheme: dark) {
+    .pill.on_shelf    { color: #4ade80; }
+    .pill.in_flight   { color: #fcd34d; }
+    .pill.undelivered { color: #fca5a5; }
+  }
 </style>
 </head>
 <body>
@@ -285,7 +336,7 @@ WORKER_PAGE = """<!doctype html>
 <div class="wrap">
   <table>
     <thead>
-      <tr><th>ID</th><th>SKU</th><th>Naziv</th><th>Cena</th><th>Akcijska</th><th>Kolicina</th><th>Izmenjeno</th><th></th></tr>
+      <tr><th>ID</th><th>SKU</th><th>Naziv</th><th>Cena</th><th>Polica</th><th>Kolicina</th><th>Izmenjeno</th><th></th></tr>
     </thead>
     <tbody id="rows"></tbody>
   </table>
@@ -293,6 +344,43 @@ WORKER_PAGE = """<!doctype html>
 <script>
 const $ = (s) => document.querySelector(s);
 let products = [];
+let shelves = {};   // sku -> latest status reported by the store
+
+const LABEL = {
+  on_shelf:    "na polici",
+  in_flight:   "salje se",
+  undelivered: "NIJE STIGLO",
+  no_tag:      "nema taga",
+  unknown:     "-",
+};
+
+function ago(seconds) {
+  if (seconds == null) return "";
+  if (seconds < 90) return seconds + "s";
+  if (seconds < 5400) return Math.round(seconds / 60) + " min";
+  return Math.round(seconds / 3600) + " h";
+}
+
+function shelfCell(sku) {
+  const s = shelves[sku];
+  if (!s) return '<span class="pill unknown">-</span>';
+  const state = s.state || "unknown";
+  let note = "";
+  if (state === "undelivered") {
+    const d = s.detail || {};
+    const bits = [];
+    if (s.attempts) bits.push(s.attempts + " pokusaja");
+    if (d.last_error) bits.push(d.last_error);
+    else if (d.tag_last_seen_seconds != null) bits.push("tag " + ago(d.tag_last_seen_seconds) + " nije javio");
+    if (d.tag_battery_mv != null && d.tag_battery_mv < 2450) bits.push("baterija " + d.tag_battery_mv + "mV");
+    if (s.shelfPrice != null) bits.push("na staklu " + s.shelfPrice);
+    note = bits.length ? ' <small>' + bits.join(", ") + '</small>' : "";
+  } else if (state === "in_flight") {
+    const d = s.detail || {};
+    if (d.waiting_seconds) note = ' <small>' + ago(d.waiting_seconds) + '</small>';
+  }
+  return '<span class="pill ' + state + '">' + (LABEL[state] || state) + "</span>" + note;
+}
 
 function apiKey() {
   let k = sessionStorage.getItem("apiKey");
@@ -322,36 +410,61 @@ function render() {
     ? products.filter((p) =>
         (p.sku + " " + p.title + " " + p.barcode).toLowerCase().includes(q))
     : products;
-  $("#rows").innerHTML = shown.map((p) => `
-    <tr data-sku="${p.sku}">
+  $("#rows").innerHTML = shown.map((p) => {
+    const s = shelves[p.sku];
+    const alert = s && s.state === "undelivered" ? " class=\\"alert\\"" : "";
+    return `
+    <tr data-sku="${p.sku}"${alert}>
       <td>${p.id}</td>
       <td>${p.sku}</td>
       <td class="title">${p.title}</td>
       <td class="num"><input type="number" step="0.01" class="price" value="${p.price}"></td>
-      <td class="num"><input type="number" step="0.01" class="sale" value="${p.salePrice ?? ""}"></td>
+      <td>${shelfCell(p.sku)}</td>
       <td class="num"><input type="number" step="1" class="stock" value="${p.stock}"></td>
       <td>${p.modifiedAt.replace("T", " ").replace("Z", "")}</td>
       <td><button class="save">Sacuvaj</button></td>
-    </tr>`).join("");
-  $("#msg").textContent = shown.length + " / " + products.length + " proizvoda";
+    </tr>`;
+  }).join("");
+
+  const bad = Object.values(shelves).filter((s) => s.state === "undelivered").length;
+  $("#msg").textContent = shown.length + " / " + products.length + " proizvoda"
+    + (bad ? "  -  " + bad + " cena NIJE stigla na policu" : "");
+  $("#msg").style.color = bad ? "#ef4444" : "";
+}
+
+async function loadShelves() {
+  try {
+    const rows = await api("/api/Esl/ShelfStatus");
+    shelves = {};
+    for (const r of rows) shelves[r.sku] = r;
+  } catch (e) {
+    // Status is advisory; never let it stop the catalog from being editable.
+  }
 }
 
 async function load() {
   try {
     products = await api("/api/Esl/Prices");
+    await loadShelves();
     render();
   } catch (e) {
     $("#msg").textContent = e.message;
   }
 }
 
+// The store reports after every sync, so refresh the colours on their own
+// without making the worker press anything.
+setInterval(async () => {
+  if (document.hidden) return;
+  await loadShelves();
+  render();
+}, 20000);
+
 $("#rows").addEventListener("click", async (ev) => {
   if (!ev.target.classList.contains("save")) return;
   const tr = ev.target.closest("tr");
-  const sale = tr.querySelector(".sale").value;
   const body = {
     price: Number(tr.querySelector(".price").value),
-    salePrice: sale === "" ? null : Number(sale),
     stock: Number(tr.querySelector(".stock").value),
   };
   tr.className = "";
@@ -458,18 +571,14 @@ class Handler(BaseHTTPRequestHandler):
                 raise ApiError(404, f"unknown sku: {sku!r}")
 
             price = row["price"]
-            sale_price = row["sale_price"]
             stock = row["stock"]
             try:
                 if "price" in payload:
                     price = float(payload["price"])
-                if "salePrice" in payload:
-                    sp = payload["salePrice"]
-                    sale_price = None if sp is None or sp == "" else float(sp)
                 if "stock" in payload:
                     stock = int(payload["stock"])
             except (TypeError, ValueError) as exc:
-                raise ApiError(400, "price/salePrice must be numbers, stock an integer") from exc
+                raise ApiError(400, "price must be a number and stock an integer") from exc
 
             if price <= 0:
                 raise ApiError(400, "price must be greater than zero")
@@ -479,10 +588,10 @@ class Handler(BaseHTTPRequestHandler):
             conn.execute(
                 """
                 UPDATE products
-                   SET price = ?, sale_price = ?, stock = ?, modified_at = ?
+                   SET price = ?, stock = ?, modified_at = ?
                  WHERE sku = ?
                 """,
-                (price, sale_price, stock, now_iso(), sku),
+                (price, stock, now_iso(), sku),
             )
             conn.commit()
             updated = serialize(conn.execute("SELECT * FROM products WHERE sku = ?", (sku,)).fetchone())
@@ -490,6 +599,104 @@ class Handler(BaseHTTPRequestHandler):
             conn.close()
 
         self.send_json(200, {"ok": True, "updated": updated})
+
+    def handle_report_shelf_status(self) -> None:
+        """A store reporting what its shelves actually show.
+
+        The store calls us; we never call the store. Rows are keyed by
+        (sku, tag_mac) and simply overwritten, so the latest report wins and
+        the table never grows beyond the number of tags in the field.
+        """
+        payload = self.read_json_body()
+        shelves = payload.get("shelves")
+        if not isinstance(shelves, list):
+            raise ApiError(400, "shelves must be a list")
+        stamp = payload.get("reported_at") or now_iso()
+        store = str(payload.get("store") or "default")
+
+        conn = connect()
+        try:
+            # The report is this store's complete picture, so anything it no
+            # longer mentions is gone -- a retired tag must not keep showing a
+            # stale red, or the colour stops meaning anything.
+            keep = {
+                (str(e["sku"]), str(e.get("tag_mac") or ""))
+                for e in shelves
+                if isinstance(e, dict) and e.get("sku")
+            }
+            for sku, mac in conn.execute(
+                "SELECT sku, tag_mac FROM shelf_status WHERE store = ?", (store,)
+            ).fetchall():
+                if (sku, mac) not in keep:
+                    conn.execute(
+                        "DELETE FROM shelf_status WHERE store = ? AND sku = ? AND tag_mac = ?",
+                        (store, sku, mac),
+                    )
+
+            for entry in shelves:
+                if not isinstance(entry, dict) or not entry.get("sku"):
+                    continue
+                conn.execute(
+                    """
+                    INSERT INTO shelf_status (sku, tag_mac, store, state, wanted_price,
+                                              shelf_price, attempts, detail, reported_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(sku, tag_mac) DO UPDATE SET
+                        store        = excluded.store,
+                        state        = excluded.state,
+                        wanted_price = excluded.wanted_price,
+                        shelf_price  = excluded.shelf_price,
+                        attempts     = excluded.attempts,
+                        detail       = excluded.detail,
+                        reported_at  = excluded.reported_at
+                    """,
+                    (
+                        str(entry["sku"]),
+                        str(entry.get("tag_mac") or ""),
+                        store,
+                        str(entry.get("state") or "unknown"),
+                        entry.get("wanted_price"),
+                        entry.get("shelf_price"),
+                        int(entry.get("attempts") or 0),
+                        json.dumps(
+                            {
+                                "waiting_seconds": entry.get("waiting_seconds"),
+                                "tag_last_seen_seconds": entry.get("tag_last_seen_seconds"),
+                                "tag_battery_mv": entry.get("tag_battery_mv"),
+                                "last_error": entry.get("last_error"),
+                            }
+                        ),
+                        stamp,
+                    ),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+        self.send_json(200, {"ok": True, "received": len(shelves)})
+
+    def handle_list_shelf_status(self) -> None:
+        conn = connect()
+        try:
+            rows = conn.execute("SELECT * FROM shelf_status").fetchall()
+        finally:
+            conn.close()
+        self.send_json(
+            200,
+            [
+                {
+                    "sku": r["sku"],
+                    "tagMac": r["tag_mac"],
+                    "state": r["state"],
+                    "wantedPrice": r["wanted_price"],
+                    "shelfPrice": r["shelf_price"],
+                    "attempts": r["attempts"],
+                    "detail": json.loads(r["detail"]) if r["detail"] else {},
+                    "reportedAt": r["reported_at"],
+                }
+                for r in rows
+            ],
+        )
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
@@ -509,6 +716,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(200, {"ok": True, "service": "central-db", "products": count})
             elif parsed.path == "/api/Esl/Prices":
                 self.handle_list_prices(query)
+            elif parsed.path == "/api/Esl/ShelfStatus":
+                self.handle_list_shelf_status()
             else:
                 raise ApiError(404, "endpoint not found")
         except ApiError as exc:
@@ -523,6 +732,8 @@ class Handler(BaseHTTPRequestHandler):
                 if not sku:
                     raise ApiError(400, "sku is required in the path")
                 self.handle_update_product(sku)
+            elif parsed.path == "/api/Esl/ShelfStatus":
+                self.handle_report_shelf_status()
             elif parsed.path == "/api/Esl/_mock/set-price":
                 # Kept so older notes and scripts that used the mock still work.
                 payload = self.read_json_body()
