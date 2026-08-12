@@ -806,3 +806,60 @@ weaker than it looked, though not formally closed.
 3. Run `/sync-now` and confirm prices from the central DB reach all three.
 4. Optional and still not applied: `maxsleep` is `0`. Setting it to ~10 bounds
    how long an *associated* tag sleeps. Separate from the scan ladder above.
+
+## 2026-08-12 (later the same day) — the cold-start sequence, confirmed
+
+**All three tags came back on the first try.** This is the first time that has
+happened, and no code was changed to achieve it — `git status` was clean and
+the last commit was documentation only. What changed was the order of power-up.
+
+### The sequence that worked (follow this every time)
+
+1. Power the **S3** first. Wait.
+2. Power the **Pi**. Wait.
+3. Power the **C6**. Wait until the AP web UI shows `apstate: 1`.
+4. Only then, **pull each tag's battery out and put it back.**
+
+The waiting between steps is not superstition — the tag has a fixed, short
+window and everything upstream of it has to already be answering.
+
+### Measured result
+
+    000001811E293B37  mode=19  pending=0  upd=9   bat=3000mV  seen 10s ago  RSSI -38
+    00000181500F3B39  mode=19  pending=0  upd=15  bat=3000mV  seen 38s ago  RSSI -39
+    0000018152583B39  mode=19  pending=0  upd=24  bat=3000mV  seen 44s ago  RSSI -43
+
+    AP uptime 811s (13.5 min), apstate 1, heap 191992
+
+All three checked in inside a 34-second spread — i.e. each one found the AP on
+its **boot scan**, not after an hour in the ladder.
+
+### Why the battery pull is a real reset
+
+These tags have **no button**, despite `resources/tagtypes/11.json` listing
+`"options": [ "button" ]`. Removing and reinserting the cell is a genuine cold
+boot of the 8051: `scanAttempts` resets to 0 and the tag re-enters
+`TagChanSearch` from the top, with the 2-minute first-boot window
+(`tag_fw/main.c:889`) rather than the 1h/2h/24h ladder.
+
+So the reset **does** work reliably — but it is only half the mechanism. The
+other half is that the AP has to be answering during those 2 minutes. A battery
+pull with no AP up does not fail gracefully; it just restarts the hour-long
+countdown, which is exactly what made this look random for weeks. Pull the
+battery again after 2-3 minutes of silence rather than waiting an hour.
+
+### Battery reading correction
+
+`0000018152583B39` read 2100 mV at the end of the previous session — below
+`BATTERY_VOLTAGE_MINIMUM` (2450) — and was written up as needing a new cell.
+It now reads 3000 mV on the **same** cell. That 2100 mV was a loaded reading
+taken after the tag had done 23 updates that day; coin cells recover their
+terminal voltage once the load is removed. Treat a single low `batteryMv` after
+heavy activity as suspect, not as proof of a flat cell.
+
+### RF wake config did not survive, as predicted
+
+All three tags read `contentMode 19`, not 18. The config queued for
+`000001811E293B37` and `0000018152583B39` was lost when the S3 was powered off
+overnight, confirming the `web.cpp:568` non-persistence gotcha above. RF wake
+is therefore **not** the reason today worked — the power-up order is.
