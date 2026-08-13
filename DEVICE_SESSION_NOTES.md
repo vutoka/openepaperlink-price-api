@@ -1269,3 +1269,48 @@ and this is the next thing to fix.
 survives a reboot instead of living only in RAM until the five-minute
 autosave — which is how an RF wake setting silently vanished overnight earlier
 in this project.
+
+### The task watchdog, fixed: a filesystem scan per tag
+
+The second core dump — `task_wdt_isr → abort()` — came down to one line.
+`contentmanager.cpp:79` had `Storage.freeSpace()` as a condition **inside the
+per-tag loop**. That call reaches `LittleFS.usedBytes()`, which walks the whole
+filesystem counting blocks; `wsSendSysteminfo` caches it for 30 seconds for
+exactly that reason. With 408 tags, contentRunner was doing **408 full
+filesystem scans, every second**.
+
+Two changes:
+
+* `Storage.freeSpace()` and `util::isSleeping()` are evaluated **once per
+  pass**. Neither describes a tag, so neither belonged in the loop.
+* `MAX_DRAWS_PER_PASS` (10) bounds how many tags get rendered in one pass.
+  Normally tags check in staggered and only a few are ever due together; the
+  case that needs bounding is a first install, where every tag in the store is
+  due at the same instant. contentRunner runs every second (`main.cpp:36`), so
+  a 400-tag backlog still clears in under a minute.
+
+Verified on hardware with all 408 tags simultaneously due:
+
+```
+restore 408 records          14.4s, "Ok, restored 408 tags."
+3 minutes under full load    0 missed responses, 0.010-0.094s throughout
+coredump partition           EMPTY  <- no panic at all
+apstate 1, runstate 2, heap 191 908 (unchanged), PSRAM free 8 283 191
+```
+
+Before this, the same load tripped the watchdog and rebooted the AP.
+
+### Where scale stands now
+
+| | |
+|---|---|
+| tags on one AP | **408 tested, stable** |
+| memory | 168 B/tag from PSRAM, 67 kB total — not a factor |
+| restore a full store | 14.4s |
+| read the DB back | 9.0s |
+| boot with 408 in flash | 6.8s |
+| radio, full push of 400 | ~26 min (400 × 3.9s) |
+
+Nothing known now blocks 400 tags on a single AP. What remains untested is the
+radio with 400 **real** tags checking in and colliding — synthetic records
+never transmit, so that cannot be simulated and needs hardware.

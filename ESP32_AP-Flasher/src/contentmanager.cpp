@@ -58,6 +58,11 @@ bool needRedraw(uint8_t contentMode, uint8_t wakeupReason) {
 // loop, on a record destroyDB() had already deleted.
 volatile bool tagDBInUse = false;
 
+// How many tags contentRunner will render for in one pass. Bounds the worst
+// case -- a whole store due at once -- without slowing the normal case, where
+// tags check in staggered and only a handful are ever due together.
+#define MAX_DRAWS_PER_PASS 10
+
 void contentRunner() {
     if (config.runStatus == RUNSTATUS_STOP) return;
 
@@ -69,16 +74,33 @@ void contentRunner() {
     WiFi.macAddress(wifimac);
     memset(&wifimac[6], 0, 2);
 
+    // Both of these describe the AP, not a tag, so they are answered once per
+    // pass instead of once per tag. Storage.freeSpace() ends up in
+    // LittleFS.usedBytes(), which walks the whole filesystem to count blocks --
+    // wsSendSysteminfo caches it for 30 seconds for exactly that reason. Asked
+    // per tag it meant 400+ full filesystem scans every second, which is what
+    // tripped the task watchdog once a database that large could be loaded.
+    const bool haveRoomToDraw = Storage.freeSpace() > 31000;
+    const bool sleeping = util::isSleeping(config.sleepTime1, config.sleepTime2);
+
+    // Drawing is the expensive part, and on a first install every tag in the
+    // store is due at the same moment. Spread that over successive passes --
+    // contentRunner runs every second (main.cpp:36), so a 400-tag store still
+    // works through its backlog in well under a minute, without any single
+    // pass hogging the loop task.
+    uint16_t drawnThisPass = 0;
+
     for (tagRecord *taginfo : tagDB) {
 
         const bool isAp = memcmp(taginfo->mac, wifimac, 8) == 0;
         if (taginfo->RSSI &&
             (now >= taginfo->nextupdate || needRedraw(taginfo->contentMode, taginfo->wakeupReason)) &&
-            config.runStatus == RUNSTATUS_RUN && 
+            config.runStatus == RUNSTATUS_RUN &&
             (taginfo->expectedNextCheckin < now + 300 || isAp || (wsClientCount() && config.stopsleep == 1)) &&
-            Storage.freeSpace() > 31000 && !util::isSleeping(config.sleepTime1, config.sleepTime2)) {
+            haveRoomToDraw && !sleeping && drawnThisPass < MAX_DRAWS_PER_PASS) {
                 drawNew(taginfo->mac, taginfo);
                 taginfo->wakeupReason = 0;
+                drawnThisPass++;
         }
 
         if (taginfo->expectedNextCheckin > now - 10 && taginfo->expectedNextCheckin < now + 30 && taginfo->pendingIdle == 0 && taginfo->pendingCount == 0 && !isAp) {
