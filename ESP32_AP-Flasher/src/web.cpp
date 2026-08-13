@@ -1063,11 +1063,29 @@ void init_web() {
 
 #define UPLOAD_BUFFER_SIZE 32768
 
+#define TAGDB_RESTORE_PATH "/current/tagDBrestored.json"
+
 struct UploadInfo {
     String filename;
     uint8_t buffer[UPLOAD_BUFFER_SIZE];
     size_t bufferSize;
 };
+
+// Append whatever is buffered and empty the buffer. `filename` is a full path
+// here, unlike doImageUpload's, which is relative to /temp.
+static void flushUploadBuffer(UploadInfo *info) {
+    if (info == nullptr || info->bufferSize == 0) return;
+    xSemaphoreTake(fsMutex, portMAX_DELAY);
+    fs::File file = contentFS->open(info->filename, "a");
+    if (file) {
+        file.write(info->buffer, info->bufferSize);
+        file.close();
+        info->bufferSize = 0;
+    } else {
+        logLine("Failed to open file for appending: " + info->filename);
+    }
+    xSemaphoreGive(fsMutex);
+}
 
 void doImageUpload(AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final) {
     String uploadfilename;
@@ -1237,25 +1255,43 @@ void dotagDBUpload(AsyncWebServerRequest *request, String filename, size_t index
     // the `final` branch that never ran, the mutex was never given back and
     // every subsequent restore blocked forever -- while still answering 200.
     // handleLittleFSUpload already writes uploads without holding the mutex.
+    // Writes go through a 32 kB buffer, the same way doImageUpload does. The
+    // chunks the web server hands us are ~1.4 kB, and appending each one
+    // separately means reopening a growing file on LittleFS every time: a
+    // 400-tag database (227 kB) took over 100 seconds that way and the
+    // transfer died before finishing. Buffered, the same file is about seven
+    // writes instead of a hundred and sixty.
     if (!index) {
         logLine("restore tagDB");
         xSemaphoreTake(fsMutex, portMAX_DELAY);
-        fs::File file = contentFS->open("/current/tagDBrestored.json", "w");
+        fs::File file = contentFS->open(TAGDB_RESTORE_PATH, "w");
         if (file) file.close();
         xSemaphoreGive(fsMutex);
+
+        UploadInfo *info = new UploadInfo{String(TAGDB_RESTORE_PATH), {}, 0};
+        request->_tempObject = (void *)info;
     }
+
+    UploadInfo *uploadInfo = static_cast<UploadInfo *>(request->_tempObject);
+    if (uploadInfo == nullptr) return;
+
     if (len) {
-        xSemaphoreTake(fsMutex, portMAX_DELAY);
-        fs::File file = contentFS->open("/current/tagDBrestored.json", "a");
-        if (file) {
-            file.write(data, len);
-            file.close();
+        if (uploadInfo->bufferSize + len > UPLOAD_BUFFER_SIZE) {
+            flushUploadBuffer(uploadInfo);
         }
-        xSemaphoreGive(fsMutex);
+        if (len <= UPLOAD_BUFFER_SIZE) {
+            memcpy(&uploadInfo->buffer[uploadInfo->bufferSize], data, len);
+            uploadInfo->bufferSize += len;
+        }
     }
+
     if (final) {
+        flushUploadBuffer(uploadInfo);
+        request->_tempObject = nullptr;
+        delete uploadInfo;
+
         destroyDB();
-        if (loadDB("/current/tagDBrestored.json")) {
+        if (loadDB(TAGDB_RESTORE_PATH)) {
             request->send(200, "text/plain", "Ok, restored " + String(tagDB.size()) + " tags.");
         } else {
             // Say so. The old code reported success unconditionally, which

@@ -1073,3 +1073,88 @@ Verification of each fix:
 
 Afterwards: 8 tags, all three price tags on `contentMode 19` showing 8499 /
 5000 / 14499 RSD, AP answering in 0.015-0.029s.
+
+## 2026-08-13 (step 3) — how far the AP actually scales
+
+Measured on the reflashed firmware, loading synthetic databases of 108, 208
+and 408 records and reading `heap`/`dbsize`/`psfree` off the AP's WebSocket
+(`tools/ap_stats.py` — these counters are not on any HTTP endpoint).
+
+### Memory is not the constraint, and it is not even close
+
+| tags | `dbsize` | free PSRAM | free heap |
+|---|---|---|---|
+| 8 | 1 299 | 8 350 303 | 191 976 |
+| 108 | 14 899 | 8 330 767 | 191 960 |
+| 208 | 28 499 | 8 314 607 | 191 932 |
+
+Linear at **178 bytes of PSRAM per tag** and 136 bytes of database per tag.
+Free heap does not move at all — records come out of PSRAM. Extrapolated, 400
+tags is about **71 kB of the 8 MB PSRAM**. Memory was never going to be the
+limit.
+
+208 tags also survive a reboot: the AP reloads them from flash and comes up
+`apstate 1`, `runstate 2`.
+
+### But 208 is not reliably safe
+
+The first load of 208 came back up with `runstate 1` (`RUNSTATUS_PAUSE`),
+which `main.cpp:175` sets **only** when `esp_reset_reason()` is
+`ESP_RST_PANIC`. The AP had crashed and rebooted. The second attempt at the
+same 208 records worked and stayed up.
+
+So: one panic in two attempts, same payload. 208 tags is not a supported
+number, it is a number that sometimes works. Do not plan a store around it
+without finding that crash.
+
+### Restores above ~116 kB fail, reproducibly, cause unknown
+
+| records | file | result |
+|---|---|---|
+| 8 | 5 kB | 0.7s |
+| 108 | 60 kB | 3.5s |
+| 208 | 116 kB | 6.5-9.8s |
+| 408 | 227 kB | **connection reset at ~70s, three times** |
+
+Not a throughput problem: at the rate 116 kB manages, 227 kB should take
+about twenty seconds. It stalls instead. I could not find the cause — the
+firmware writes almost nothing to `Serial` after boot, so there is no
+backtrace to read, and the failure leaves no trace in the tag database.
+
+**Buffering did help, just not with this.** Writing through a 32 kB buffer
+(`flushUploadBuffer`, mirroring `doImageUpload`) took 108 records from 8.4s to
+3.5s, a 2.4x improvement, and left the 227 kB cliff exactly where it was.
+
+Failure is at least safe: `destroyDB()` runs only on `final`, so a reset
+transfer leaves the previous database intact. Confirmed — the tag count stayed
+at 208 after a failed 408.
+
+### The mutex fix is confirmed working
+
+After a failed 227 kB upload, the next restore completed in 1.1s and answered
+`Ok, restored 8 tags.` On the pre-flash firmware that exact sequence wedged
+`/restore_db` permanently. The wedge is gone.
+
+### `/littlefs_put` has the same false-200 bug
+
+`POST /littlefs_put` with `path` and `file` (exactly what `main.js:802` sends)
+returned **HTTP 200 while writing nothing** — the target path was a 404
+afterwards. Same root cause as `/restore_db` had: the response comes from the
+request handler, which never learns what the upload handler did. Not fixed,
+just recorded.
+
+### CORRECTION: dead tags do *not* slow the AP down
+
+An earlier entry in this file claimed that 40 phantom tags degraded the AP to
+0.15-8.4s responses with 33% packet loss, and turned that into a production
+rule about pruning dead records. **That was wrong**, and the rule was built on
+it.
+
+With 108 and then 208 phantom tags loaded — five times as many — the AP
+answered in **0.010-0.034s with no packet loss at all**. Tag count is not what
+did it. The real cause was the wedged `fsMutex` from the aborted 408 upload
+that had happened just before those measurements: with the filesystem locked,
+everything touching it stalled.
+
+Pruning genuinely dead tags is still reasonable housekeeping, but it is not
+urgent and it is not a performance fix. `PRICE_API.md` has been corrected too.

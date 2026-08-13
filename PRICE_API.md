@@ -360,9 +360,17 @@ extra hardware. Full detail in `DEVICE_SESSION_NOTES.md`.
 | limit | value | where |
 |---|---|---|
 | tags per `/get_db` page | ~11 (5000-byte cap) | `tag_db.cpp:80` |
-| **hard wall, tags per AP** | **255** | `?pos=` was a `uint8_t`, `web.cpp:477` |
+| ~~hard wall, tags per AP~~ | ~~255~~ — **fixed, flashed 2026-08-13** | `?pos=` widened to `uint16_t`, `web.cpp:477` |
+| memory per tag | 178 B of PSRAM (400 tags ≈ 71 kB of 8 MB) | measured |
+| **largest restore that works** | **~116 kB / ~208 records** | 227 kB resets at ~70s, cause unknown |
+| **largest tag count proven stable** | **108** | 208 loads and reboots fine but panicked once in two tries |
 | radio time per tag | 3.9s | measured, 296×128 tag |
 | full push, 400 tags | ~26 min | 400 × 3.9s, serialised |
+
+The 255-tag pagination wall is gone, but it was not the real ceiling. Memory
+is nowhere near a limit; what is unproven is stability above ~108 tags and the
+ability to load a full store's database in one restore. **Both need solving
+before a 400-tag store, and neither is about the radio.**
 
 Three bugs came out of it, all fixed but **the two firmware ones are not
 flashed yet**:
@@ -379,16 +387,18 @@ flashed yet**:
 Until the AP is reflashed, `POST /restore_db` returning 200 proves nothing.
 Read `/get_db` back and count.
 
-### Prune dead tags — they cost the whole AP
+### Prune dead tags — housekeeping, not performance
 
-Records for tags that never check in are not free. With 40 of them in the
-database the AP answered `/sysinfo` in 0.15-8.4s and lost 33% of pings;
-deleting them brought it back to 0.01-0.16s and 0% loss. `contentRunner()`
-keeps trying to render for every record, including ones that will never
-answer.
+An earlier version of this section claimed dead records slow the AP down,
+based on 40 phantom tags coinciding with 0.15-8.4s responses and 33% packet
+loss. **That was a misattribution.** Loading 108 and then 208 phantom tags
+later produced 0.010-0.034s responses and no loss; the slowdown had come from
+a wedged `fsMutex`, not from the tag count. Measurements are in
+`DEVICE_SESSION_NOTES.md`.
 
-So when a tag is retired — dead battery, taken off a shelf, replaced — delete
-its record:
+Deleting retired tags is still worth doing — a dead record in the list makes a
+genuinely dead tag harder to spot — but it is ordinary tidying, not a fix for
+anything. When a tag is retired, delete its record:
 
 ```bash
 curl -X POST -d "mac=<MAC>&cmd=del" http://192.168.0.34/tag_cmd
