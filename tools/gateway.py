@@ -68,6 +68,10 @@ SKU_BATCH_SIZE = int(os.getenv("GATEWAY_SKU_BATCH_SIZE", "100"))
 # The AP's plain web port, where /get_db and /current/<mac>.json live. This is
 # a different port from the authenticated price API in ESP_BASE_URL.
 AP_WEB_URL = os.getenv("AP_WEB_URL", "http://192.168.0.34").rstrip("/")
+# /get_db hands back ~11 tags per page, and the firmware cannot page past 255
+# tags at all, so 32 pages is far more than can ever be reached. It exists to
+# bound the loop if the AP starts repeating pages, not as a tuning knob.
+AP_DB_MAX_PAGES = int(os.getenv("AP_DB_MAX_PAGES", "32"))
 # How long to let a push sit unconfirmed before sending it again. Tags check in
 # every ~60s when associated, but one that is asleep can take much longer, so
 # this wants to be generous enough not to spam the radio.
@@ -189,17 +193,53 @@ def fetch_tag_state() -> dict[str, dict[str, Any]]:
 
     Returns an empty dict if the AP cannot be reached -- callers treat that as
     "cannot confirm anything right now", never as "nothing was delivered".
+
+    `/get_db` is paginated: the AP stops filling a response once it passes
+    ~5000 bytes (tag_db.cpp:80) and reports where to resume in `continu`.
+    Measured against our own tags that is about 11 records per page, so a
+    single unpaginated read is fine with three tags on the bench and quietly
+    wrong in a real store -- every tag past the first page would look
+    unconfirmed, get retried, and end up reported as undelivered while its
+    price was in fact on the glass. So read until the AP runs out.
     """
-    try:
-        payload = http_get_json(f"{AP_WEB_URL}/get_db", {})
-    except (urllib.error.URLError, json.JSONDecodeError, TimeoutError) as exc:
-        log(f"cannot read tag state from AP: {exc}")
-        return {}
     state: dict[str, dict[str, Any]] = {}
-    for tag in payload.get("tags", []):
-        mac = str(tag.get("mac", "")).upper()
-        if mac:
-            state[mac] = tag
+    pos = 0
+    # Two independent stops, because neither is sufficient on its own: the AP
+    # truncates ?pos= to a uint8_t (web.cpp:477), so asking for 256 silently
+    # restarts from zero, and a wrapped page looks perfectly valid.
+    for _ in range(AP_DB_MAX_PAGES):
+        try:
+            payload = http_get_json(f"{AP_WEB_URL}/get_db?pos={pos}", {})
+        except (urllib.error.URLError, json.JSONDecodeError, TimeoutError) as exc:
+            log(f"cannot read tag state from AP: {exc}")
+            # A later page failing still leaves the earlier ones usable, and
+            # confirming some tags beats confirming none.
+            return state
+
+        new_on_this_page = 0
+        for tag in payload.get("tags", []):
+            mac = str(tag.get("mac", "")).upper()
+            if mac and mac not in state:
+                state[mac] = tag
+                new_on_this_page += 1
+
+        nxt = payload.get("continu")
+        if not nxt:
+            break  # AP says this was the last page
+        nxt = int(nxt)
+        if nxt <= pos or new_on_this_page == 0:
+            # Either the AP pointed backwards or the page repeated what we
+            # already had -- both mean ?pos= wrapped. Stop rather than loop.
+            log(f"AP tag DB pagination stalled at pos={pos}; "
+                f"read {len(state)} tags")
+            break
+        if nxt > 255:
+            log(f"AP tag DB has more than 255 tags: /get_db cannot be asked "
+                f"for pos={nxt} because the firmware truncates it to a uint8_t. "
+                f"{len(state)} tags readable, the rest cannot be confirmed.")
+            break
+        pos = nxt
+
     return state
 
 

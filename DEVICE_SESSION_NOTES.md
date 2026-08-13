@@ -863,3 +863,83 @@ All three tags read `contentMode 19`, not 18. The config queued for
 `000001811E293B37` and `0000018152583B39` was lost when the S3 was powered off
 overnight, confirming the `web.cpp:568` non-persistence gotcha above. RF wake
 is therefore **not** the reason today worked — the power-up order is.
+
+## 2026-08-13 — scale testing without 400 tags, and three bugs it found
+
+The open question before production was how the system behaves with a few
+hundred tags when we only own three. Most of that risk turns out not to be in
+the radio at all: the AP holding the records, `/get_db` paging them out, and
+the gateway reading them back are all exercisable with tags that do not exist.
+`tools/make_synthetic_tagdb.py` generates a tag database and the AP's own
+`POST /restore_db` loads it.
+
+Everything below was found on the bench in one session, with no extra hardware.
+
+### The AP already knows 8 tags, not 3
+
+`GET /get_db` lists three `hwType 17` price tags, two `hwType 1`, and three
+`hwType 0`. Relevant because the limits below are counted in tags, not shelves.
+
+### Bug 1 — the gateway confirmed deliveries for only the first ~11 tags
+
+`tagDBtoJson` stops filling a response once it passes 5000 bytes
+(`tag_db.cpp:80`) and reports where to resume in `continu`. Measured at **444
+bytes per tag, so about 11-12 records per page**. `fetch_tag_state()` read one
+page and ignored `continu`.
+
+With three tags this is invisible. Loaded with 48, the old code saw **12 of
+48**; the other 36 would never confirm, would be retried to exhaustion and
+reported `undelivered` while their prices were in fact on the glass — the
+shelf-status column would go red across the store for a system that was
+working. Fixed: `fetch_tag_state()` now follows `continu`, and reads 48 of 48.
+
+### Bug 2 — the AP cannot page past 255 tags at all
+
+`web.cpp:477`:
+
+    uint8_t startPos = 0;
+    startPos = atoi(request->getParam("pos")->value().c_str());
+
+`atoi` returns `int` into a `uint8_t`, so `?pos=256` truncates to 0 and the AP
+restarts from the beginning. Any client that keeps following `continu` past
+255 loops forever. **This is a hard wall at 255 tags per AP** and needs a
+firmware change (`uint16_t`) plus a reflash. The gateway now detects the wrap
+and stops with an explicit log line rather than spinning.
+
+### Bug 3 — an interrupted `/restore_db` wedges further restores
+
+`dotagDBUpload` (`web.cpp:1223`) takes `fsMutex` on the first chunk and
+releases it only on `final`. Uploading 408 records (227 KB) held the
+filesystem locked and the connection was reset after 67s, so `final` never
+ran — the mutex was never given back. Two consequences:
+
+* The DB survived intact, because `destroyDB()` also only runs on `final`.
+  Failure is at least safe.
+* Every later restore silently did nothing. A subsequent 108-record upload
+  returned **HTTP 200 in 8.4s and changed nothing** — the tag DB stayed at the
+  previous 48 records.
+
+The 200 is meaningless: `request->send(200)` sits in the request handler
+(`web.cpp:1010`) and fires regardless of what the upload handler did. **Never
+treat a 200 from `/restore_db` as proof it worked — read `/get_db` back.**
+
+Sizes that did work: 48 records in 2.2s, 108 records in 8.4s (before the
+wedge). Only a reboot clears it.
+
+### What this means for provisioning
+
+Restoring a full store's tag database is exactly what happens when a shop is
+set up or an AP is replaced, so all three bugs sit on the provisioning path.
+Bug 2 in particular caps a single AP at 255 tags regardless of radio capacity,
+which is an architecture input, not a tuning detail.
+
+### Cloudflare tunnel and the old gateway.service are gone
+
+Earlier notes above describe a Quick Tunnel exposing the Pi; it no longer
+exists. Both `cloudflared-quicktunnel.service` and the stale July 31
+`gateway.service` (which was still polling `192.168.31.66:9000` every five
+minutes from `/opt/gateway/`) were stopped and `systemctl disable`d on
+2026-08-13. `price-proxy` binds to `127.0.0.1` and `sync-now.timer` drives it
+from inside the Pi, so **the Pi's only externally reachable port is now SSH
+(22)**. Nothing calls into the store, which is the whole point of the polling
+architecture. Treat any mention of a tunnel hostname above as historical.
