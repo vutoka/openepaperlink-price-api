@@ -1418,3 +1418,70 @@ It was pushed by hand instead of waiting, and confirmed — `updatecount` 69 →
 
 Final state: 8 tags, all three shelves at 8499 / 5000 / 14499 RSD,
 `sync-now.timer` active again, heap 191 712.
+
+## 2026-08-13 (test 1) — hard power cut during an active write
+
+Physical test: with a 208-tag database loaded (to make each full `saveDB()`
+write and its content non-trivial, and representative of production tag
+counts), a background loop hit `POST /save_cfg` for a synthetic tag every
+0.3s for up to 90s -- `/save_cfg` was fixed earlier today to call `saveDB()`
+unconditionally on the *whole* `tagDB`, so each call is a full rewrite of
+`tagDB.json`, not a one-record edit. The owner pulled the S3's power directly
+from the wall, on a verbal cue, mid-loop.
+
+The AP was unreachable from the very first request in the loop (connection
+timeout, 0 bytes) through at least 26 consecutive attempts covering roughly a
+minute. That does not distinguish "power died before the first request
+arrived" from "power died while the AP was mid-write and never got to
+respond" -- both look identical from the client side. Recorded as an open
+question rather than claimed as certainty.
+
+### Result: clean recovery either way
+
+```
+boot time after power restored        0.1s
+tagDB.json (flash)                    208 records, fully valid JSON
+  -- includes all 8 real tags, correct mac/hwType/contentMode/modecfgjson
+tagDB.json.bak                        0 bytes (see note below)
+all 3 price tags                      contentMode 19, pending 0, correct
+                                       shelf content, batteryMv 3000
+```
+
+No truncation, no parse failure, no crash, no stuck state. Whatever the AP was
+doing when power was cut, it came back with a fully intact, fully readable tag
+database.
+
+The `.bak` file being empty is not evidence of a problem: `/restore_db`
+(used to load the 208-tag set) calls `loadDB()` directly and never touches
+`tagDB.json` or its `.bak` at all -- only the periodic 5-minute autosave,
+`/reboot`, and now `/save_cfg` write it. So `.bak` reflects whatever was there
+before this test's first real `saveDB()` call, not a byproduct of the power
+cut itself.
+
+### A red herring, not a corruption finding
+
+Bosch briefly showed **787.00 RSD** instead of 8499 after recovery. Traced to
+the catalog itself: `GET /api/Esl/Products` showed `price: 787.0`,
+`modifiedAt: 2026-08-13T13:38:08Z` -- a real write, not stale seed data (the
+original seed price for this SKU is 8990, per `central_db.py:122`, and none of
+today's scripted tests ever compute 787). Most likely explanation: the owner
+tried the worker UI by hand shortly after being shown how, which is exactly
+the intended workflow -- and the system correctly carried whatever was typed
+through to the glass. Not a bug; if anything, a confirmation that the manual
+price-edit path works. Reset to 8499 and confirmed on the tag afterward.
+
+### Housekeeping
+
+The 200 synthetic tags loaded for this test were removed with
+`cleanup_synthetic_tags.py --delete`, and a `/reboot` was used to force the
+clean 8-tag state to flash (autosave is every 5 minutes; forcing it removes
+the "still recoverable to 208 by a stray reboot" window). Confirmed
+`tagDB.json` back to 5037 bytes / 8 records.
+
+### Reading this result
+
+LittleFS + the rename-to-`.bak`-before-write pattern in `saveDB()` held up
+under a real, physical, unrehearsed power cut. That is a meaningfully
+different guarantee than the clean `/reboot`-based tests earlier today. It is
+not proof that every possible byte-offset of interruption is safe -- only that
+this attempt, at this moment, recovered cleanly.
