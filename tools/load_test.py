@@ -65,8 +65,13 @@ TARGETS = [
     ("DEWALT-DCD778", "0000018152583B39", 14499.00),
 ]
 
-CONFIRM_TIMEOUT = 180.0
-POLL = 0.4
+# A round that runs past this means a tag is still busy redrawing the previous
+# update, which is a property of hammering three tags, not of the system. Cap
+# it rather than spend three minutes re-learning that every round.
+CONFIRM_TIMEOUT = 90.0
+# Polling every 0.4s across three tags is 7.5 requests a second at the AP --
+# enough load to distort what is being measured.
+POLL = 1.0
 # The AP's price API allows one request a second (web.cpp:93) and answers 429
 # above that. gateway.py already spaces its pushes; anything else must too.
 RESTORE_SPACING = 2.0
@@ -189,6 +194,29 @@ def rendered_carries(mac: str, price: float) -> bool:
         return False
 
 
+def with_retry(what: str, fn, attempts: int = 6):
+    """Retry a call that talks over the LAN.
+
+    A first 100-update run died after three rounds: the catalog host dropped
+    off the network for about four minutes and thirty-one consecutive rounds
+    were recorded as failures, which made the whole run worthless. A blip is
+    not a result -- the real gateway retries on its next cycle too -- so a
+    round is only a failure here if it still cannot get through after backing
+    off several times.
+    """
+    delay = 2.0
+    last = None
+    for attempt in range(attempts):
+        try:
+            return fn()
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            last = exc
+            if attempt + 1 < attempts:
+                time.sleep(delay)
+                delay = min(delay * 2, 30.0)
+    raise RuntimeError(f"{what} nije uspelo posle {attempts} pokusaja: {last}")
+
+
 def set_catalog_price(sku: str, price: float) -> None:
     body = json.dumps({"price": price}).encode()
     req = urllib.request.Request(
@@ -261,8 +289,8 @@ def main() -> int:
 
         try:
             for sku, _, _ in batch:
-                set_catalog_price(sku, prices[sku])
-            sync_now()
+                with_retry(f"set {sku}", lambda s=sku: set_catalog_price(s, prices[s]))
+            with_retry("sync-now", sync_now)
         except Exception as exc:
             print(f"runda {r+1:3d}  GRESKA pri slanju: {exc}")
             failures += len(batch)
@@ -331,13 +359,13 @@ def restore() -> int:
     print("vracanje polaznih cena:")
     for sku, mac, base in TARGETS:
         try:
-            set_catalog_price(sku, base)
+            with_retry(f"restore {sku}", lambda s=sku, b=base: set_catalog_price(s, b))
             print(f"  {sku} <- {base:.2f} RSD")
         except Exception as exc:
             print(f"  {sku} GRESKA: {exc}")
         time.sleep(RESTORE_SPACING)
     try:
-        result = sync_now()
+        result = with_retry("sync-now", sync_now)
         print(f"  sync: {result}")
     except Exception as exc:
         print(f"  sync GRESKA: {exc}")

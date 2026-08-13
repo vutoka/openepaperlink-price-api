@@ -1314,3 +1314,56 @@ Before this, the same load tripped the watchdog and rebooted the AP.
 Nothing known now blocks 400 tags on a single AP. What remains untested is the
 radio with 400 **real** tags checking in and colliding — synthetic records
 never transmit, so that cannot be simulated and needs hardware.
+
+## 2026-08-13 (load test) — why cycling updates cannot time a 400-tag store
+
+The idea was to avoid buying 400 tags by sending 400 price updates round-robin
+to the three real ones. It is worth recording that this **does not** answer the
+timing question, and why, so nobody tries it again expecting a number.
+
+### The measurements move the wrong way
+
+| method | per update | extrapolated to 400 |
+|---|---|---|
+| one update at a time, wait for each | 20s | 133 min |
+| three in parallel, one sync per round | 33.8s | 226 min |
+| **one radio transfer, measured directly** | **3.9s** | **~26 min** |
+
+Parallelising made it *worse*, which is the tell. The bottleneck is not the AP
+— it is that **an e-ink refresh takes seconds and a tag cannot accept a new
+image while it is redrawing**. Three tags absorbing 400 updates do over a
+hundred refreshes each, back to back. A real store does the opposite: 400 tags,
+one refresh each, all redrawing in parallel while the AP serves them in turn.
+
+So the honest number for a full store stays **400 × 3.9s ≈ 26 minutes**, from
+the airtime measurement, not from this test. And a normal morning pushes only
+the prices that changed, which is a handful.
+
+### What the run is actually for
+
+Endurance. Three pushes never show a slow leak, bookkeeping drift, or
+something that only breaks on the two-hundredth operation. Free heap moved
+191 608 → 190 632 → 190 904 over the first three rounds — down then up, so
+allocation churn rather than an obvious leak, but worth a longer look.
+
+### A transient network drop invalidated the first attempt
+
+The first 100-update run reported 92 failures in 6.7 minutes. Rounds 1-3 were
+fine; from round 4 onward, thirty-one consecutive rounds failed with
+`No route to host`. The catalog host had simply dropped off the LAN for a few
+minutes — it was reachable again afterwards, and its own log shows it served
+every request it received.
+
+Two lessons:
+
+* `load_test.py` now retries with backoff (`with_retry`) instead of recording
+  a blip as a result. A fifty-minute run must not be thrown away by four
+  minutes of Wi-Fi.
+* Keeping the catalog on a laptop is fine for exercising the real network path,
+  but a laptop can vanish from the network. In production this is the
+  partner's server, so it does not carry over — but expect it during testing.
+
+Also tightened: confirmation timeout 180s → 90s (a round that runs longer just
+means a tag is still redrawing), and polling 0.4s → 1.0s, since three tags
+polled at 0.4s is 7.5 requests a second at the AP — enough load to distort what
+is being measured.
