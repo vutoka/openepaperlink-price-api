@@ -1158,3 +1158,114 @@ everything touching it stalled.
 
 Pruning genuinely dead tags is still reasonable housekeeping, but it is not
 urgent and it is not a performance fix. `PRICE_API.md` has been corrected too.
+
+## 2026-08-13 (later) — the 208 crash, root-caused from a core dump
+
+### Reading the core dump
+
+The build sets `-D ARDUINO_USB_CDC_ON_BOOT`, so `Serial` goes to the S3's
+**native USB port**, not the CH343 UART on `COM16`. That is why capturing the
+serial log during a crash produced nothing useful — the wrong port was being
+watched, and only one cable was connected.
+
+There is a better route that needs no second cable: `large_spiffs_16MB.csv`
+reserves a **`coredump` partition at 0xFF0000 (64 kB)**, and the Arduino build
+writes panics there. Read it over the same cable:
+
+```bash
+python ~/.platformio/packages/tool-esptoolpy/esptool.py \
+    --port COM16 --baud 460800 read_flash 0xFF0000 0x10000 coredump.bin
+# strip the 20-byte header, the rest is an ELF core file
+pip install esp-coredump
+~/.platformio/packages/toolchain-xtensa-esp32s3/bin/xtensa-esp32s3-elf-gdb.exe \
+    --batch -q -ex "thread 1" -ex "bt" firmware.elf core.elf
+```
+
+(`esp-coredump` itself refused to find GDB even with it on PATH; carving the
+ELF out and running GDB directly works and is fewer moving parts. Match the
+core against the **exact** firmware.elf that was running, or the symbols lie.)
+
+### Root cause: a race, not a size limit
+
+```
+#0  0x40056eea in ?? ()                        <- memcmp, in ROM
+#1  0x4201f831 in contentRunner ()  contentmanager.cpp:64
+#2  0x420222d7 in loop ()           main.cpp:200
+#3  loopTask
+```
+
+`contentmanager.cpp:64` is `memcmp(taginfo->mac, wifimac, 8)`. The crash is a
+dereference of a **deleted `tagRecord`**.
+
+`contentRunner()` walks `tagDB` from the loop task and **yields inside that
+walk** (`vTaskDelay(1)` per tag, added so other tasks can run). Meanwhile
+`/restore_db` calls `destroyDB()` from the web server task, which `delete`s
+every record. Nothing synchronised the two. `checkVars()` iterates the same
+list and has the same exposure.
+
+That explains everything that looked like a size limit:
+
+* **Intermittent** — it depends on whether the loop task happens to be
+  mid-walk. One crash in two attempts at 208.
+* **Worse with bigger databases** — more tags means a longer walk, so a wider
+  window; 8 records never showed it.
+* **The "227 kB restore cliff" was the same bug.** The AP was panicking
+  *during* the upload, which reset the TCP connection. It was never a timeout
+  and never a throughput limit. Three failures at ~70s, all the same crash.
+
+### The fix
+
+`tagDBInUse` (contentmanager) is set while the loop task walks `tagDB`.
+`/restore_db` now sets `RUNSTATUS_STOP`, waits for that flag to clear (up to
+5s, normally instant), then destroys and reloads, then restores the previous
+run status. This mirrors how `updateFirmware` (`ota.cpp:229`) already quiesces
+the AP before touching shared state.
+
+Confirmed after flashing:
+
+| test | before | after |
+|---|---|---|
+| 208 records, 3 consecutive | crashed 1 in 2 | **3/3 OK** (6.6s, 8.5s, 9.0s) |
+| 408 records | reset at ~70s, 3/3 failed | **OK in 13.1s** |
+| read all 408 back, paginated | impossible | **408/408 in 9.0s** |
+| boot with 408 in flash | untested | **6.8s** (8 tags: 7.3s) |
+
+Memory at 408 tags: `dbsize` 55 699, free heap 191 916 (unchanged from 8
+tags), free PSRAM 8 283 171 — **168 bytes per tag**, all from PSRAM. The
+earlier extrapolation of ~71 kB for 400 tags came out at 67 kB. Memory is not
+a constraint and never was.
+
+### Two of our own guards had outlived their purpose
+
+Removing the firmware's 255 limit exposed two client-side caps that silently
+truncated reads:
+
+* `gateway.py` refused to request `pos > 255` — correct against old firmware,
+  now wrong. It stopped at 264 of 408 tags.
+* `AP_DB_MAX_PAGES` was 32, chosen when 255 was the ceiling. At ~12 tags per
+  page that capped reads at **384** of 408. Raised to 256 pages (~3000 tags).
+
+Both are the same trap: a workaround for a bug outliving the bug, and failing
+quietly rather than loudly.
+
+### Still open: the task watchdog trips at 408 tags
+
+A second core dump, taken after the race fix, is a different failure —
+`task_wdt_isr → abort()`, a **task watchdog timeout**, not a use-after-free.
+
+Prime suspect is `contentRunner` itself at that scale: `contentmanager.cpp:69`
+calls `Storage.freeSpace()` **per tag**, and every synthetic tag was due for an
+update at once, so it also attempts `drawNew()` for all of them. That is a
+realistic worst case, not just a test artifact — it is exactly what a
+first-time store install looks like.
+
+The AP recovers on its own (it rebooted and came back with all 408 records,
+`runstate 2`). But **400 simultaneously-due tags on one AP is not yet safe**,
+and this is the next thing to fix.
+
+### `/save_cfg` now persists
+
+`saveDB` at `web.cpp:573` is uncommented. Tag config set through the web UI
+survives a reboot instead of living only in RAM until the five-minute
+autosave — which is how an RF wake setting silently vanished overnight earlier
+in this project.

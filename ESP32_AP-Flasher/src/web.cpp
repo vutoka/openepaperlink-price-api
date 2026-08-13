@@ -15,6 +15,7 @@
 #include "LittleFS.h"
 #include "SPIFFSEditor.h"
 #include "commstructs.h"
+#include "contentmanager.h"
 #include "language.h"
 #include "leds.h"
 #include "newproto.h"
@@ -570,7 +571,14 @@ void init_web() {
                         taginfo->invert = atoi(request->getParam("invert", true)->value().c_str());
                     }
                     wsSendTaginfo(mac, SYNC_USERCFG);
-                    // saveDB("/current/tagDB.json");
+                    // Persist immediately. With this commented out, tag config
+                    // set through /save_cfg lived only in RAM and was lost on
+                    // the next reboot -- which is how an RF wake setting
+                    // silently disappeared overnight earlier in this project.
+                    // The periodic autosave (main.cpp:39) would eventually
+                    // catch it, but "eventually" is not what a config save
+                    // means to whoever pressed the button.
+                    saveDB("/current/tagDB.json");
                     request->send(200, "text/plain", "Ok, saved");
                 } else {
                     request->send(200, "text/plain", "Error while saving: mac not found");
@@ -1290,8 +1298,23 @@ void dotagDBUpload(AsyncWebServerRequest *request, String filename, size_t index
         request->_tempObject = nullptr;
         delete uploadInfo;
 
+        // destroyDB() deletes every record. The loop task walks the same list
+        // in contentRunner()/checkVars() and yields inside that walk, so doing
+        // this without waiting frees records it is still dereferencing -- a
+        // core dump caught it crashing in memcmp on a deleted tagRecord. It is
+        // a race, so it only bites sometimes, and the bigger the database the
+        // likelier: 8 records never showed it, 208 crashed one attempt in two.
+        const uint8_t previousRunStatus = config.runStatus;
+        config.runStatus = RUNSTATUS_STOP;
+        for (int waited = 0; tagDBInUse && waited < 200; waited++) {
+            vTaskDelay(25 / portTICK_PERIOD_MS);  // up to 5s, normally none
+        }
+
         destroyDB();
-        if (loadDB(TAGDB_RESTORE_PATH)) {
+        const bool loaded = loadDB(TAGDB_RESTORE_PATH);
+        config.runStatus = previousRunStatus;
+
+        if (loaded) {
             request->send(200, "text/plain", "Ok, restored " + String(tagDB.size()) + " tags.");
         } else {
             // Say so. The old code reported success unconditionally, which

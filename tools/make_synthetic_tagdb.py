@@ -95,14 +95,6 @@ def fetch_real_tags(base_url: str, timeout: float = 15.0) -> list[dict]:
         if not nxt or int(nxt) <= pos:
             break
         pos = int(nxt)
-        if pos > 255:
-            print(
-                f"  ! AP cannot be asked for position {pos}: /get_db truncates "
-                f"?pos= to a uint8_t, so it would restart from 0. "
-                f"Stopping at {len(tags)} tags.",
-                file=sys.stderr,
-            )
-            break
 
     return tags
 

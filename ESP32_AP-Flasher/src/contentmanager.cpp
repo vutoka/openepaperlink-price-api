@@ -50,8 +50,18 @@ bool needRedraw(uint8_t contentMode, uint8_t wakeupReason) {
     return false;
 }
 
+// Set while the loop task is walking tagDB. `/restore_db` destroys and
+// rebuilds that list from the web task, and the loop below deliberately
+// yields (vTaskDelay) in the middle of its iteration, so without this the
+// web task can free records that contentRunner still holds a pointer to.
+// A core dump caught exactly that: memcmp on taginfo->mac at the top of the
+// loop, on a record destroyDB() had already deleted.
+volatile bool tagDBInUse = false;
+
 void contentRunner() {
     if (config.runStatus == RUNSTATUS_STOP) return;
+
+    tagDBInUse = true;
 
     time_t now;
     time(&now);
@@ -98,9 +108,13 @@ void contentRunner() {
 
         vTaskDelay(1 / portTICK_PERIOD_MS);  // add a small delay to allow other threads to run
     }
+
+    tagDBInUse = false;
 }
 
 void checkVars() {
+    // Same shared list, same loop task -- see tagDBInUse above.
+    tagDBInUse = true;
     JsonDocument cfgobj;
     for (tagRecord *tag : tagDB) {
         if (tag->contentMode == 19) {
@@ -134,6 +148,7 @@ void checkVars() {
     for (const auto &entry : varDB) {
         if (entry.second.changed) varDB[entry.first].changed = false;
     }
+    tagDBInUse = false;
 }
 
 /// @brief Draw a counter

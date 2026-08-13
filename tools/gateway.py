@@ -68,10 +68,12 @@ SKU_BATCH_SIZE = int(os.getenv("GATEWAY_SKU_BATCH_SIZE", "100"))
 # The AP's plain web port, where /get_db and /current/<mac>.json live. This is
 # a different port from the authenticated price API in ESP_BASE_URL.
 AP_WEB_URL = os.getenv("AP_WEB_URL", "http://192.168.0.34").rstrip("/")
-# /get_db hands back ~11 tags per page, and the firmware cannot page past 255
-# tags at all, so 32 pages is far more than can ever be reached. It exists to
-# bound the loop if the AP starts repeating pages, not as a tuning knob.
-AP_DB_MAX_PAGES = int(os.getenv("AP_DB_MAX_PAGES", "32"))
+# /get_db hands back ~11-12 tags per page. This only bounds the loop if the AP
+# starts repeating pages; it is not a tuning knob. It was 32, which quietly
+# capped reads at 384 tags once the firmware's own 255 limit was lifted -- the
+# guard outlived the thing it was guarding against. 256 pages is roughly 3000
+# tags, far past anything one AP will serve.
+AP_DB_MAX_PAGES = int(os.getenv("AP_DB_MAX_PAGES", "256"))
 # How long to let a push sit unconfirmed before sending it again. Tags check in
 # every ~60s when associated, but one that is asleep can take much longer, so
 # this wants to be generous enough not to spam the radio.
@@ -229,14 +231,14 @@ def fetch_tag_state() -> dict[str, dict[str, Any]]:
         nxt = int(nxt)
         if nxt <= pos or new_on_this_page == 0:
             # Either the AP pointed backwards or the page repeated what we
-            # already had -- both mean ?pos= wrapped. Stop rather than loop.
+            # already had. On firmware that still truncates ?pos= to a uint8_t
+            # this is what a wrap past 255 looks like -- the page is perfectly
+            # valid, it is just the start of the database again. Stop rather
+            # than loop forever. Firmware from 2026-08-13 uses a uint16_t and
+            # does not do this, so on a current AP it means something else and
+            # is worth seeing in the log.
             log(f"AP tag DB pagination stalled at pos={pos}; "
                 f"read {len(state)} tags")
-            break
-        if nxt > 255:
-            log(f"AP tag DB has more than 255 tags: /get_db cannot be asked "
-                f"for pos={nxt} because the firmware truncates it to a uint8_t. "
-                f"{len(state)} tags readable, the rest cannot be confirmed.")
             break
         pos = nxt
 

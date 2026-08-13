@@ -361,16 +361,23 @@ extra hardware. Full detail in `DEVICE_SESSION_NOTES.md`.
 |---|---|---|
 | tags per `/get_db` page | ~11 (5000-byte cap) | `tag_db.cpp:80` |
 | ~~hard wall, tags per AP~~ | ~~255~~ — **fixed, flashed 2026-08-13** | `?pos=` widened to `uint16_t`, `web.cpp:477` |
-| memory per tag | 178 B of PSRAM (400 tags ≈ 71 kB of 8 MB) | measured |
-| **largest restore that works** | **~116 kB / ~208 records** | 227 kB resets at ~70s, cause unknown |
-| **largest tag count proven stable** | **108** | 208 loads and reboots fine but panicked once in two tries |
+| memory per tag | 168 B of PSRAM (408 tags = 67 kB of 8 MB) | measured |
+| restore of 408 records | 13.1s | was failing; race fixed |
+| paginated read of 408 tags | 9.0s | needs `AP_DB_MAX_PAGES` ≥ 35 |
+| boot with 408 tags in flash | 6.8s | 8 tags: 7.3s |
 | radio time per tag | 3.9s | measured, 296×128 tag |
 | full push, 400 tags | ~26 min | 400 × 3.9s, serialised |
 
-The 255-tag pagination wall is gone, but it was not the real ceiling. Memory
-is nowhere near a limit; what is unproven is stability above ~108 tags and the
-ability to load a full store's database in one restore. **Both need solving
-before a 400-tag store, and neither is about the radio.**
+**The 208-tag crash and the "227 kB restore limit" were the same bug** — a race
+between `contentRunner()` walking `tagDB` and `/restore_db` deleting it out
+from under the loop task. Root-caused from a core dump, fixed, and confirmed:
+3/3 restores at 208 and a clean 408 where every attempt used to fail. Details
+in `DEVICE_SESSION_NOTES.md`.
+
+**Still open before a 400-tag store:** with all 408 tags due for an update at
+once, the task watchdog trips — `contentRunner` calls `Storage.freeSpace()` per
+tag and tries to draw all of them. The AP recovers by itself, but that is the
+first-install scenario, so it needs fixing. Memory and the radio are both fine.
 
 Three bugs came out of it, all fixed but **the two firmware ones are not
 flashed yet**:

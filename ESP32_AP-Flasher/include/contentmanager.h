@@ -17,6 +17,10 @@ struct contentTypes {
 
 void contentRunner();
 void checkVars();
+
+// True while the loop task is iterating tagDB. Anything that destroys or
+// rebuilds that list from another task must wait for this to clear first.
+extern volatile bool tagDBInUse;
 void drawNew(const uint8_t mac[8], tagRecord *&taginfo);
 bool updateTagImage(String &filename, const uint8_t *dst, uint16_t nextCheckin, tagRecord *&taginfo, imgParam &imageParams);
 void drawString(TFT_eSprite &spr, String content, int16_t posx, int16_t posy, String font, byte align = 0, uint16_t color = TFT_BLACK, uint16_t size = 30, uint16_t bgcolor = TFT_WHITE);
