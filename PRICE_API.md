@@ -379,6 +379,25 @@ flashed yet**:
 Until the AP is reflashed, `POST /restore_db` returning 200 proves nothing.
 Read `/get_db` back and count.
 
+### Prune dead tags — they cost the whole AP
+
+Records for tags that never check in are not free. With 40 of them in the
+database the AP answered `/sysinfo` in 0.15-8.4s and lost 33% of pings;
+deleting them brought it back to 0.01-0.16s and 0% loss. `contentRunner()`
+keeps trying to render for every record, including ones that will never
+answer.
+
+So when a tag is retired — dead battery, taken off a shelf, replaced — delete
+its record:
+
+```bash
+curl -X POST -d "mac=<MAC>&cmd=del" http://192.168.0.34/tag_cmd
+```
+
+`tools/cleanup_synthetic_tags.py` does this in bulk for a MAC prefix and reads
+the database back to confirm. Avoid `cmd=purge`: it removes everything unseen
+for 24 hours, including real tags that are merely idle.
+
 ## Optional computer-side proxy
 
 The older helper below remains available when HTTPS termination or a more

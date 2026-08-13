@@ -924,7 +924,8 @@ The 200 is meaningless: `request->send(200)` sits in the request handler
 treat a 200 from `/restore_db` as proof it worked — read `/get_db` back.**
 
 Sizes that did work: 48 records in 2.2s, 108 records in 8.4s (before the
-wedge). Only a reboot clears it.
+wedge). Only a reboot clears **the wedge** — it is a held mutex, i.e. RAM
+state. A reboot does *not* clear the loaded tags themselves; see below.
 
 ### What this means for provisioning
 
@@ -985,3 +986,40 @@ Restoring the three prices back-to-back after the measurement returned
 pushes 1.1s apart so it never sees this, but anything else driving the API
 must. At 400 tags that throttle alone is ~7 minutes of enqueueing, which
 overlaps the 26 minutes of radio time rather than adding to it.
+
+### Dead tags degrade the whole AP, not just themselves
+
+While the 40 synthetic tags sat in the database, the AP became barely usable:
+`/sysinfo` took **0.15-8.4s** to answer, one request in five timed out
+entirely, and **33% of pings were lost** with RTT spiking to 1283 ms. Deleting
+them restored it immediately — 0.01-0.16s and **0% loss** on the same link,
+minutes later, with nothing else changed.
+
+The cause is `contentRunner()` walking the whole tag database and trying to
+generate content for records that will never check in. Forty was enough to
+starve the web server and the radio task.
+
+This is a production finding, not a test artifact. A store accumulates dead
+records — tags that fail, get removed from a shelf, or have their battery run
+out — and each one keeps costing the AP. **Prune the tag database when a tag
+is retired**; `POST /tag_cmd` with `cmd=del` is the per-tag delete, and
+`tools/cleanup_synthetic_tags.py` shows the pattern (read `/get_db`
+paginated, delete by MAC, read it back to confirm).
+
+`cmd=purge` deletes everything not seen in 24 hours in one call, which is
+convenient but takes any real tag that is merely idle. Prefer targeted
+deletes.
+
+### Removing synthetic tags: what does not work
+
+* **A reboot does not clear them.** `main.cpp:39` autosaves the tag database
+  to flash every five minutes and `main.cpp:143` loads it back at boot, so
+  synthetic records survive a power cycle. An earlier note in this file said
+  otherwise; it was wrong.
+* **`/restore_db` cannot be used** while the `fsMutex` wedge described above
+  is in effect — it answers 200 and does nothing.
+
+Per-tag `cmd=del` needs neither a reboot nor a reflash and does not interrupt
+the shelves. All three price tags kept `contentMode 19` and their
+`modecfgjson` through the cleanup, and were confirmed showing 8499 / 5000 /
+14499 RSD afterwards.
