@@ -1367,3 +1367,54 @@ Also tightened: confirmation timeout 180s → 90s (a round that runs longer just
 means a tag is still redrawing), and polling 0.4s → 1.0s, since three tags
 polled at 0.4s is 7.5 requests a second at the AP — enough load to distort what
 is being measured.
+
+### Endurance run: 100 updates, no leak
+
+Second attempt, with retries in place. 39.1 minutes, **92 of 100 confirmed**.
+
+| | |
+|---|---|
+| free heap, start → end | 191 988 → 191 748 |
+| batteries, all three | 3000 mV → **3000 mV** |
+| updates per tag | 31 / 31 / 33 |
+| round of 3, average | 68.4s |
+| failures | 8, all from one network drop |
+
+**No memory leak.** Free heap moved 240 bytes over 92 confirmed updates and
+wandered up as often as down (191 200 … 191 860 mid-run). The apparent
+34 bytes/update slide seen in the first twelve updates was allocation churn.
+
+**Batteries did not move.** Thirty-odd full e-ink refreshes per tag in forty
+minutes left all three reading 3000 mV, which retires the earlier worry that a
+long run would flatten them — and further supports the reading that the 2100 mV
+seen on 2026-08-11 was a loaded measurement, not a tired cell.
+
+The 8 failures were one round that could not reach the catalog (`No route to
+host` after six backed-off retries) plus the round after it. **The catalog host
+dropped off the LAN twice in one afternoon**, both times for a few minutes,
+both times recovering by itself. Worth knowing while it lives on a laptop; in
+production it is the partner's server.
+
+Note the throughput line the script prints — 25.5s per update, 170 min for 400
+— is still the number that does not transfer, for the e-ink reason above. It is
+printed with that caveat attached.
+
+### The delivery bookkeeping proved itself in passing
+
+Restoring the original prices at the end coincided with restarting
+`sync-now.timer`, so two syncs overlapped and one push hit the AP's
+one-per-second limit:
+
+```
+price_cache  DEWALT-DCD778 = 14532.00   <- what the glass really showed
+delivery     DEWALT-DCD778 = 14499.00, attempts 1,
+             last_error: HTTP 429 "rate limit: wait one second"
+```
+
+Exactly the intended behaviour: the refused price was not silently dropped,
+`price_cache` kept describing the glass rather than the intention, the reason
+was recorded, and the retry would have resent it within the 15-minute window.
+It was pushed by hand instead of waiting, and confirmed — `updatecount` 69 → 70.
+
+Final state: 8 tags, all three shelves at 8499 / 5000 / 14499 RSD,
+`sync-now.timer` active again, heap 191 712.
