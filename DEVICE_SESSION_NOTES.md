@@ -1485,3 +1485,85 @@ under a real, physical, unrehearsed power cut. That is a meaningfully
 different guarantee than the clean `/reboot`-based tests earlier today. It is
 not proof that every possible byte-offset of interruption is safe -- only that
 this attempt, at this moment, recovered cleanly.
+
+## 2026-08-13 (test 2) — the catalog on a genuinely separate network
+
+Physical test: with the store (Pi, S3, C6, tags) untouched on the home LAN, only
+the laptop running `central_db.py` moved to a real external network, to check
+the one untested assumption in `ARHITEKTURA.md` -- that "the Pi pulls prices"
+still works when the catalog is not on the same local network, which is the
+real production shape (the partner's server will be somewhere on the internet).
+
+### Getting a genuinely separate network took three tries
+
+1. **A different home Wi-Fi/guest network was not separate enough.** Different
+   subnet, different gateway, but the AP/Pi were still directly reachable --
+   traceroute showed the gateway forwarding straight to `192.168.0.x`. Most
+   likely a guest/IoT SSID on the same router without client isolation.
+
+2. **A phone hotspot with the phone's own Wi-Fi still on was not separate
+   either, and looked identical from the outside.** Many Android phones share
+   whatever uplink they're currently using when hotspot is enabled, and
+   default to Wi-Fi over cellular if both are available -- even with mobile
+   data turned on. The laptop got a distinct SSID and subnet
+   (`Redmi Note 10 Pro`, `172.21.247.x`) but traffic to `192.168.0.x` was
+   silently bridged through the phone's own Wi-Fi connection to the same home
+   router. `netsh wlan show interfaces` (actual connected SSID) was the
+   reliable check -- IP address and gateway alone were not enough evidence.
+
+3. **Phone Wi-Fi off, hotspot on cellular data**, confirmed by SSID and by the
+   home LAN becoming genuinely unreachable (SSH and HTTP to the Pi/AP both
+   timed out) while the tunnel stayed up. This was the first point all session
+   the isolation was real rather than assumed.
+
+### The tunnel itself did not survive the network change
+
+`cloudflared`'s Quick Tunnel was started *before* switching networks. The
+moment the laptop's Wi-Fi actually changed, the tunnel's QUIC connection died
+(`wsasendto: ... unreachable network`) and it spent over an hour retrying with
+exponential backoff (up to 1m4s between attempts) without ever recovering --
+confirmed via `journalctl`-equivalent inspection of its own log. From outside
+this looked exactly like the tunnel hostname had stopped existing (`NXDOMAIN`
+even from `1.1.1.1` directly), which cost real time chasing a DNS red herring
+before the actual cause (a dead QUIC session, not a naming problem) turned up
+in the log.
+
+**Fix:** kill and restart `cloudflared` *after* the network change, not before.
+A tunnel started on the network it will actually run on came up clean and
+stayed up for the rest of the test. This means: if the catalog machine will
+ever change networks (sleep/wake on a different Wi-Fi, VPN toggling, etc.),
+the tunnel needs restarting -- it will not self-heal.
+
+### A real limitation this test exposed: I run on the machine being isolated
+
+Every command in this project runs on the owner's laptop -- the same machine
+that test 2 needed to isolate. Once it was genuinely off the home network,
+`ssh` to the Pi stopped working, which meant the new tunnel URL could not be
+pushed to `/etc/price-proxy.env` without a brief, deliberate reconnect to the
+home network. This is not a flaw in the store's architecture -- the store
+never needed inbound reachability from the catalog side, by design -- it is
+specific to using the catalog machine as the operator console during a test.
+A separate management path (e.g. operating from a phone, or configuring the
+Pi before the catalog moves) would avoid this in a future run.
+
+### Result: it works, end to end, over a real internet path
+
+With `PACMS_BASE_URL` and `STATUS_REPORT_URL` pointed at the tunnel and the
+laptop genuinely unreachable from the store's LAN, the owner changed
+`BOSCH-GSB13RE` to 500 RSD through the worker UI reached *only* via the tunnel
+URL, confirmed reaching the tag visually. Verification of delivery used
+`GET /api/Esl/ShelfStatus` through the same tunnel rather than direct AP
+access, since direct access was exactly what was unavailable -- which is
+itself evidence the outbound-status-report design (`PRICE_API.md`) works as
+intended when the operator is genuinely remote.
+
+### Cleanup
+
+Catalog price reset to 8499 (via `localhost:9000`, independent of any network
+state). `PACMS_BASE_URL` / `STATUS_REPORT_URL` restored to
+`http://192.168.0.30:9000` once the laptop was confirmed back on the real home
+SSID (`Djokic`, `192.168.0.30`, gateway `192.168.0.1` -- checked directly with
+`netsh wlan show interfaces`, not inferred from IP alone, given how this test
+went). `cloudflared.exe` stopped. Confirmed afterward: 8 tags, all three
+shelves at 8499 / 5000 / 14499 RSD, `pending 0`, 3000 mV, `sync-now` working
+over the local path again.
