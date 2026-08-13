@@ -1023,3 +1023,53 @@ Per-tag `cmd=del` needs neither a reboot nor a reflash and does not interrupt
 the shelves. All three price tags kept `contentMode 19` and their
 `modecfgjson` through the cleanup, and were confirmed showing 8499 / 5000 /
 14499 RSD afterwards.
+
+### Flashed, and all three fixes confirmed on hardware
+
+Flashed over USB rather than OTA: `/update_ota` does not accept an uploaded
+file, it takes `url`/`md5`/`size` and makes the AP fetch the binary itself,
+which needs a web server on the LAN. With the S3 on a cable that is a detour.
+
+Note which port. The board enumerates two USB devices and only one is useful
+here:
+
+* `USB-Enhanced-SERIAL CH343 (COM16)`, `VID_1A86&PID_55D3` — the UART bridge,
+  **this is the one to flash through**
+* `USB Serial Device (COM4)`, `VID_303A&PID_1001` — the S3's native USB. It
+  showed up in Windows only as a not-present ghost from an earlier session.
+
+Always confirm what is on the other end before writing, since the C6 is on the
+same bench:
+
+```bash
+python ~/.platformio/packages/tool-esptoolpy/esptool.py --port COM16 chip_id
+# Chip is ESP32-S3 (QFN56) (revision v0.2)
+# Features: WiFi, BLE, Embedded PSRAM 8MB (AP_3v3)
+# MAC: ac:a7:04:26:a2:ac
+```
+
+Then:
+
+```bash
+pio run -e ESP32_S3_SIMPLE_AP -t upload --upload-port COM16
+```
+
+1985952 bytes, hash verified, 100s. `-t upload` writes the app partition only,
+so LittleFS — `tagDB.json`, the web UI, everything under `/current/` —
+survives. `sysinfo.buildtime` went 1786104105 → 1786615119, which is the
+cheapest proof the new image is actually running.
+
+**The tags came back on their own. No battery reseat was needed**, unlike
+every earlier power cycle — because the AP was answering by the time they
+next checked in.
+
+Verification of each fix:
+
+| fix | test | result |
+|---|---|---|
+| `uint16_t startPos` | `/get_db?pos=256` with 8 tags | returns 0 tags. Old firmware truncated 256 to 0 and returned all 8 — a wrap that looked like valid data |
+| `/restore_db` reporting | upload the 8-tag backup | **`Ok, restored 8 tags.`** — the count comes from `tagDB.size()`; the old build said `Ok, restored.` even when it had done nothing |
+| `fsMutex` per chunk | same upload, 1.8s | completes and takes effect; no wedge |
+
+Afterwards: 8 tags, all three price tags on `contentMode 19` showing 8499 /
+5000 / 14499 RSD, AP answering in 0.015-0.029s.
