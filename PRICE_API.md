@@ -374,10 +374,19 @@ from under the loop task. Root-caused from a core dump, fixed, and confirmed:
 3/3 restores at 208 and a clean 408 where every attempt used to fail. Details
 in `DEVICE_SESSION_NOTES.md`.
 
-**Still open before a 400-tag store:** with all 408 tags due for an update at
-once, the task watchdog trips — `contentRunner` calls `Storage.freeSpace()` per
-tag and tries to draw all of them. The AP recovers by itself, but that is the
-first-install scenario, so it needs fixing. Memory and the radio are both fine.
+**The task watchdog trip is fixed too.** `contentRunner` was calling
+`Storage.freeSpace()` — a full LittleFS block scan — once per tag, every
+second. It is now evaluated once per pass, and drawing is capped at 10 tags per
+pass so a first install cannot hog the loop task. Verified with all 408 tags
+due at once: three minutes of load, zero missed responses, no panic.
+
+**408 tags on one AP is now tested and stable.** Nothing known blocks a
+400-tag store on a single S3.
+
+The one thing still unmeasured is the radio with 400 **real** tags checking in
+and colliding. Synthetic records never transmit, so that cannot be simulated —
+it needs actual hardware, and it is the only remaining reason to buy tags
+before committing to a store layout.
 
 Three bugs came out of it, all fixed but **the two firmware ones are not
 flashed yet**:
