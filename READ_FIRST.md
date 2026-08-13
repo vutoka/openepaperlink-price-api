@@ -15,7 +15,14 @@ making changes or asking an AI agent to work on the repo.
 3. `DEVICE_SESSION_NOTES.md`
    - Detailed hardware/session notes, backup hashes, and operational caveats.
 
-4. Relevant source files:
+4. `ARHITEKTURA.md` (Serbian)
+   - The agreed production shape and the decisions behind it: the Pi pulls on
+     a schedule and nothing calls into the store, prices are identical in every
+     physical store, and one S3 covers a 400-tag store. Also carries the
+     measured scale numbers. **This file is the canonical copy** — there is a
+     working duplicate on the owner's Desktop, but edits belong here.
+
+5. Relevant source files:
    - `ESP32_AP-Flasher/src/web.cpp`
    - `ESP32_AP-Flasher/include/tag_db.h`
    - `ESP32_AP-Flasher/src/tag_db.cpp`
