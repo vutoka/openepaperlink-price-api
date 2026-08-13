@@ -108,7 +108,10 @@ extern Config config;
 extern std::vector<tagRecord*> tagDB;
 extern std::unordered_map<int, HwType> hwtype;
 extern std::unordered_map<std::string, varStruct> varDB;
-extern String tagDBtoJson(const uint8_t mac[8] = nullptr, uint8_t startPos = 0);
+// startPos is uint16_t, not uint8_t: /get_db pages roughly 11 tags at a time,
+// so a store with more than 255 tags needs positions a byte cannot hold. It
+// used to truncate, silently restarting pagination from zero.
+extern String tagDBtoJson(const uint8_t mac[8] = nullptr, uint16_t startPos = 0);
 extern bool deleteRecord(const uint8_t mac[8], bool allVersions = true);
 extern void fillNode(JsonObject& tag, const tagRecord* taginfo);
 extern void saveDB(const String& filename);

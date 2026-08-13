@@ -331,34 +331,53 @@ most one price push per second, so a large batch can take several minutes;
 the tunnel's own request timeout may be shorter than that even though the
 sync keeps running correctly in the background.
 
-## Cloudflare Quick Tunnel on the Raspberry Pi
+## Cloudflare Quick Tunnel — retired 2026-08-13
 
-Until a named tunnel with a stable hostname is set up (requires a domain in
-the Cloudflare account), the Pi runs a Cloudflare Quick Tunnel pointed at the
-local proxy. The unit file is:
-
-```text
-tools/cloudflared-quicktunnel.service
-```
-
-Installed target path:
-
-```text
-/etc/systemd/system/cloudflared-quicktunnel.service
-```
-
-It depends on and starts after `price-proxy.service`, and forwards
-`https://<random>.trycloudflare.com` to `http://localhost:8000` (the proxy,
-not the ESP directly).
-
-The quick tunnel has no uptime guarantee and gets a new random hostname every
-time the service restarts. After the Pi boots or the service restarts, read
-the current URL from the journal:
+The Pi used to run a Cloudflare Quick Tunnel forwarding
+`https://<random>.trycloudflare.com` to `http://localhost:8000`, so the store
+could be reached from outside. **It is gone**, along with the stale
+`gateway.service` that was still polling an old address from `/opt/gateway/`:
 
 ```bash
-sudo journalctl -u cloudflared-quicktunnel --no-pager \
-  | grep -o 'https://[a-zA-Z0-9.-]*trycloudflare.com' | tail -1
+sudo systemctl disable --now cloudflared-quicktunnel.service gateway.service
 ```
+
+Nothing calls into the store any more. `price-proxy` binds to `127.0.0.1` and
+`sync-now.timer` drives it from inside the Pi, so the Pi's only externally
+reachable port is SSH (22). That is the point of the polling architecture: a
+price changed while the store is offline is picked up on the next pull instead
+of being lost, and no inbound path, domain, or tunnel is needed at all.
+
+`tools/cloudflared-quicktunnel.service` is kept in the repo for reference
+only. Do not re-enable it without a reason.
+
+## Scale: what breaks between 3 tags and a real store
+
+Measured 2026-08-13 with `tools/make_synthetic_tagdb.py`, which builds a tag
+database that the AP's own `POST /restore_db` loads, so most of this needs no
+extra hardware. Full detail in `DEVICE_SESSION_NOTES.md`.
+
+| limit | value | where |
+|---|---|---|
+| tags per `/get_db` page | ~11 (5000-byte cap) | `tag_db.cpp:80` |
+| **hard wall, tags per AP** | **255** | `?pos=` was a `uint8_t`, `web.cpp:477` |
+| radio time per tag | 3.9s | measured, 296×128 tag |
+| full push, 400 tags | ~26 min | 400 × 3.9s, serialised |
+
+Three bugs came out of it, all fixed but **the two firmware ones are not
+flashed yet**:
+
+1. `gateway.py` read only the first page of `/get_db` and ignored `continu`,
+   so above ~11 tags most deliveries were never confirmed and were reported
+   `undelivered` while the prices were on the glass. Fixed and deployed.
+2. The AP truncated `?pos=` to a `uint8_t`, capping any AP at 255 tags.
+   Widened to `uint16_t` — **needs a reflash**.
+3. An interrupted `/restore_db` never released `fsMutex`, silently wedging
+   every later restore while still returning HTTP 200. Fixed to take the mutex
+   per chunk and to answer 500 on a parse failure — **needs a reflash**.
+
+Until the AP is reflashed, `POST /restore_db` returning 200 proves nothing.
+Read `/get_db` back and count.
 
 ## Optional computer-side proxy
 

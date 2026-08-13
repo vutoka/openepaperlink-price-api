@@ -474,9 +474,14 @@ void init_web() {
                 json = "{\"error\": \"malformatted parameter\"}";
             }
         } else {
-            uint8_t startPos = 0;
+            // uint16_t, not uint8_t: /get_db hands back about 11 tags per
+            // page, so a store past 255 tags needs a position a byte cannot
+            // hold. As a uint8_t this truncated -- ?pos=256 became 0 and
+            // pagination silently restarted from the beginning, so no client
+            // could ever read past tag 255.
+            uint16_t startPos = 0;
             if (request->hasParam("pos")) {
-                startPos = atoi(request->getParam("pos")->value().c_str());
+                startPos = strtoul(request->getParam("pos")->value().c_str(), nullptr, 10);
             }
             json = tagDBtoJson(nullptr, startPos);
         }
@@ -1007,7 +1012,10 @@ void init_web() {
     });
     server.on(
         "/restore_db", HTTP_POST, [](AsyncWebServerRequest *request) {
-            request->send(200);
+            // Intentionally silent. dotagDBUpload answers once it knows
+            // whether loadDB actually parsed the file; a 200 from here fired
+            // regardless of what the upload did, so callers could not tell a
+            // real restore from one that silently did nothing.
         },
         dotagDBUpload);
 
@@ -1221,19 +1229,40 @@ void doJsonUpload(AsyncWebServerRequest *request) {
 }
 
 void dotagDBUpload(AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final) {
+    // fsMutex is taken and released around each chunk rather than held for
+    // the whole upload. Holding it end to end looked harmless with a handful
+    // of tags, but a real store's database is a couple of hundred kB: that
+    // locked the filesystem for over a minute, starving every other task, and
+    // the transfer was reset before finishing. Because the release lived in
+    // the `final` branch that never ran, the mutex was never given back and
+    // every subsequent restore blocked forever -- while still answering 200.
+    // handleLittleFSUpload already writes uploads without holding the mutex.
     if (!index) {
         logLine("restore tagDB");
         xSemaphoreTake(fsMutex, portMAX_DELAY);
-        request->_tempFile = contentFS->open("/current/tagDBrestored.json", "w");
+        fs::File file = contentFS->open("/current/tagDBrestored.json", "w");
+        if (file) file.close();
+        xSemaphoreGive(fsMutex);
     }
     if (len) {
-        request->_tempFile.write(data, len);
+        xSemaphoreTake(fsMutex, portMAX_DELAY);
+        fs::File file = contentFS->open("/current/tagDBrestored.json", "a");
+        if (file) {
+            file.write(data, len);
+            file.close();
+        }
+        xSemaphoreGive(fsMutex);
     }
     if (final) {
-        request->_tempFile.close();
-        xSemaphoreGive(fsMutex);
         destroyDB();
-        loadDB("/current/tagDBrestored.json");
-        request->send(200, "text/plain", "Ok, restored.");
+        if (loadDB("/current/tagDBrestored.json")) {
+            request->send(200, "text/plain", "Ok, restored " + String(tagDB.size()) + " tags.");
+        } else {
+            // Say so. The old code reported success unconditionally, which
+            // made a restore that changed nothing indistinguishable from one
+            // that worked -- and destroyDB() has already run by this point,
+            // so the caller badly needs to know.
+            request->send(500, "text/plain", "restore failed: could not parse uploaded tagDB");
+        }
     }
 }

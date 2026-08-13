@@ -66,7 +66,7 @@ bool hex2mac(const String& hexString, uint8_t* mac) {
     }
 }
 
-String tagDBtoJson(const uint8_t mac[8], uint8_t startPos) {
+String tagDBtoJson(const uint8_t mac[8], uint16_t startPos) {
     JsonDocument doc;
     JsonArray tags = doc["tags"].to<JsonArray>();
 

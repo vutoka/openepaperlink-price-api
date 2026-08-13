@@ -943,3 +943,45 @@ minutes from `/opt/gateway/`) were stopped and `systemctl disable`d on
 from inside the Pi, so **the Pi's only externally reachable port is now SSH
 (22)**. Nothing calls into the store, which is the whole point of the polling
 architecture. Treat any mention of a tunnel hostname above as historical.
+
+### Measured: what one tag costs the radio
+
+Fleet size is limited by how long the AP is *busy* with a tag, not by how
+often tags wake up — sleeping tags are free. Measured by pushing a price and
+polling one tag's record at 0.3s, watching `lastseen` move (the tag is talking)
+and then `updatecount` increment (it has taken the image):
+
+| tag | push accepted | waited for check-in | **transfer** | total |
+|---|---|---|---|---|
+| Bosch  `…293B37` | 0.13s | 9.9s  | **3.9s** | 13.8s |
+| Makita `…0F3B39` | 0.14s | 22.3s | **3.9s** | 26.2s |
+| DeWalt `…583B39` | 0.16s | 4.6s  | **3.9s** | 8.5s  |
+
+**3.9 seconds per tag**, identical across all three to the limit of the
+sampling interval — as expected for a fixed 296×128 1-bit image. Check-in wait
+varied 4.6-22.3s and is latency, not cost.
+
+Serialised, that gives:
+
+| tags | radio time |
+|---|---|
+| 100 | ~7 min |
+| 255 (the firmware wall) | ~17 min |
+| 400 | ~26 min |
+
+So a full push to 400 tags is around **26 minutes** — comfortably inside a
+morning window, and this is the worst case that only happens on first install
+or after an AP replacement. A normal morning pushes only changed prices, which
+is a handful. **Radio capacity is not the constraint; the 255-tag pagination
+wall is.**
+
+Treat 3.9s as a floor: it assumes no collisions and no retries, and larger tag
+types will take longer.
+
+### The price API rate-limits, and it bites at scale
+
+Restoring the three prices back-to-back after the measurement returned
+**HTTP 429 Too Many Requests** on the second one. `gateway.py` already spaces
+pushes 1.1s apart so it never sees this, but anything else driving the API
+must. At 400 tags that throttle alone is ~7 minutes of enqueueing, which
+overlaps the 26 minutes of radio time rather than adding to it.
