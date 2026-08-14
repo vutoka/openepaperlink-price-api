@@ -161,6 +161,28 @@ keep it on the local network, do not expose it publicly.
 `gateway.py` needs no changes to work against this service; the HTTP contract
 is the same one it was written for.
 
+### Before production: secure the catalog
+
+Tested 2026-08-13 (session notes: "test 2") by exposing `central_db.py`
+through a free Cloudflare Quick Tunnel so the Pi could pull prices over a
+real internet path, not just the LAN. That proved the polling architecture
+works over the internet, but the tunnel's only protection was the
+`X-Api-Key` header, and `CENTRAL_DB_API_KEY` was left at its weak default
+(`dev-mock-key`) -- fine for a one-off test, not for anything left open.
+
+Agreed plan (2026-08-14) for whenever the real catalog goes live, in order:
+
+1. **Real domain** instead of an ephemeral `*.trycloudflare.com` Quick Tunnel
+   URL, which changes every time the tunnel restarts.
+2. **Strong, randomly generated `CENTRAL_DB_API_KEY`**, not the `dev-mock-key`
+   default.
+3. **Cloudflare Access in front of it** (email sign-in) as a second layer, so
+   a leaked or guessed API key alone is not enough to reach the catalog.
+
+None of this applies to the store side -- the Pi/S3/C6/tags never accept
+inbound connections regardless (see "Cloudflare Quick Tunnel -- retired"
+below), so there is nothing to secure there beyond what already exists.
+
 ### Shelf status
 
 The worker page has a **Polica** column showing what each price actually did:
