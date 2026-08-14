@@ -67,6 +67,36 @@ static bool validPriceApiText(const String &value, size_t maxLength) {
     return value.length() > 0 && value.length() <= maxLength;
 }
 
+// How wide `text` would be drawn in bahnschrift70, in pixels.
+//
+// That font holds thirteen glyphs and nothing else -- '-', '.' and the ten
+// digits -- so it cannot render a currency name, a space, or any letter.
+// Characters it lacks draw nothing yet still take part in the right-aligned
+// datum calculation, which is what silently pushed the leading digit off the
+// left edge and put 499.00 on a shelf that was sent 8499.00. Measuring here
+// lets us drop to a smaller font instead of clipping: a price shown small is
+// merely ugly, a price shown truncated is wrong.
+//
+// Advances are read from the font file itself; unknown characters count as
+// the widest digit so an unexpected string errs toward the smaller font.
+static uint16_t priceWidthAt70(const String &text) {
+    static const uint8_t digitWidth[10] = {39, 23, 36, 37, 40, 38, 36, 35, 39, 36};
+    uint16_t width = 0;
+    for (size_t i = 0; i < text.length(); i++) {
+        const char c = text[i];
+        if (c >= '0' && c <= '9') {
+            width += digitWidth[c - '0'];
+        } else if (c == '.' || c == ',') {
+            width += 16;
+        } else if (c == '-') {
+            width += 34;
+        } else {
+            width += 40;
+        }
+    }
+    return width;
+}
+
 static void initPriceApi() {
     apiServer.on("/health", HTTP_GET, [](AsyncWebServerRequest *request) {
         JsonDocument response;
@@ -135,9 +165,16 @@ static void initPriceApi() {
             sendApiJson(request, 404, response);
             return;
         }
-        if (taginfo->hwType != 17) {
+        // Both 2.9" M2 variants are accepted: they differ only in the display
+        // controller (SOLUM_29_SSD1619 = 0x01, SOLUM_29_UC8151 = 0x11) and are
+        // identical where this endpoint cares -- 296x128, 2bpp, black/white/red
+        // (resources/tagtypes/01.json and 11.json). The layout below is plain
+        // 296x128 geometry, so it renders the same on either. Anything else is
+        // still refused, because those coordinates are hardcoded and would draw
+        // off-screen or misplaced on a different size.
+        if (taginfo->hwType != 17 && taginfo->hwType != 1) {
             response["ok"] = false;
-            response["error"] = "price-v1 currently supports hwType 17 only";
+            response["error"] = "price-v1 supports the 296x128 2.9\" tags only (hwType 1 or 17)";
             sendApiJson(request, 400, response);
             return;
         }
@@ -151,16 +188,31 @@ static void initPriceApi() {
         box.add(128);
         box.add(0);
 
+        // The product name stops short of the right edge, leaving that corner
+        // for the currency -- bahnschrift70 has no letters, so the currency
+        // cannot sit beside the price, and there is no vertical room for it
+        // below one.
         JsonArray productBox = elements.add<JsonObject>()["textbox"].to<JsonArray>();
         productBox.add(8);
         productBox.add(5);
-        productBox.add(280);
+        productBox.add(232);
         productBox.add(34);
         productBox.add(product);
         productBox.add("bahnschrift20");
         productBox.add(1);
         productBox.add(1);
         productBox.add(0);
+
+        if (currency.length()) {
+            JsonArray currencyText = elements.add<JsonObject>()["text"].to<JsonArray>();
+            currencyText.add(288);
+            currencyText.add(12);
+            currencyText.add(currency);
+            currencyText.add("bahnschrift20");
+            currencyText.add(1);
+            currencyText.add(2);
+            currencyText.add(0);
+        }
 
         JsonArray separator = elements.add<JsonObject>()["line"].to<JsonArray>();
         separator.add(8);
@@ -169,11 +221,15 @@ static void initPriceApi() {
         separator.add(42);
         separator.add(1);
 
+        // 280px is the drawable span between the 8px margins. Anything wider
+        // gets the smaller font rather than losing its leading digits.
+        const bool priceFitsLarge = priceWidthAt70(price) <= 280;
+
         JsonArray priceText = elements.add<JsonObject>()["text"].to<JsonArray>();
         priceText.add(288);
-        priceText.add(51);
-        priceText.add(price + " " + currency);
-        priceText.add("bahnschrift70");
+        priceText.add(priceFitsLarge ? 46 : 64);
+        priceText.add(price);
+        priceText.add(priceFitsLarge ? "bahnschrift70" : "bahnschrift30");
         priceText.add(1);
         priceText.add(2);
         priceText.add(0);

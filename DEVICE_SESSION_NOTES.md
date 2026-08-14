@@ -1567,3 +1567,73 @@ SSID (`Djokic`, `192.168.0.30`, gateway `192.168.0.1` -- checked directly with
 went). `cloudflared.exe` stopped. Confirmed afterward: 8 tags, all three
 shelves at 8499 / 5000 / 14499 RSD, `pending 0`, 3000 mV, `sync-now` working
 over the local path again.
+
+## 2026-08-14 -- a second tag type, and a price that lied
+
+Two firmware changes, both in `ESP32_AP-Flasher/src/web.cpp`, driven by an
+upcoming purchase of 80 tags.
+
+### The price endpoint accepted only one of two identical tag types
+
+`web.cpp` refused anything but `hwType 17`. But `tag_types.h` holds two 2.9"
+Solum M2 variants that differ only in display controller:
+
+    SOLUM_29_SSD1619 = 0x01   (1)
+    SOLUM_29_UC8151  = 0x11   (17)
+
+`resources/tagtypes/01.json` and `11.json` are identical where this endpoint
+cares -- 296x128, 2bpp, black/white/red -- and the layout is plain 296x128
+geometry, so the check was stricter than the drawing required. Relaxed to
+accept both.
+
+Proven on hardware, on two independent `hwType 1` tags: `000002387AD03B10`
+(new, had never appeared in the AP database before) and `00000238FECF3B12`.
+Both rendered a test price correctly. This roughly doubles the pool of
+buyable tags and removes the main risk of ordering 80 of the wrong variant,
+since marketplace listings never state the hwType.
+
+Still refused, deliberately: M3/nRF tags (0x33, 384x168) and every other
+size, because the coordinates below are fixed.
+
+### Weak batteries look like a radio problem, not a flat cell
+
+`00000238FECF3B12` had been silent for 165 hours with a recorded RSSI of
+-83. With fresh cells it answered immediately at **-43**, same tag, same
+distance. A dying cell does not present as a dead tag; it presents as one
+that checks in rarely and reports a weak signal, which reads like range or
+collision trouble. Worth remembering when 80 second-hand tags arrive with
+years-old cells -- budget a full set of CR2450 with the order.
+
+### The shelf showed 499.00 for a price of 8499.00
+
+Found by looking at the glass, not the API: every shelf was missing its
+leading digit and the currency. `5000.00` drew as `000.00`, `8499.00` as
+`499.00`, `1234.00` as `234.00`.
+
+Cause, measured by parsing `data/fonts/bahnschrift70.vlw` rather than
+guessed: **that font contains thirteen glyphs** -- `-`, `.` and the ten
+digits. No letters, no space. The endpoint drew `price + " " + currency`,
+so four characters of `"8499.00 RSD"` had no glyph. They drew nothing but
+still counted toward the right-aligned datum (`align 2` = `TR_DATUM` at
+x=288), shifting the real digits left, off the edge. That is why the
+currency was never visible either.
+
+A second, latent bug in the same place: measured advances in that font give
+
+    999.00      202px
+    5000.00     249px
+    14499.00    269px      (drawable span is 280px)
+    129990.00   300px      -> silently clipped
+
+so any six-figure price would have been wrong too. For a hardware store
+that is an ordinary price.
+
+Fix: draw the price alone in `bahnschrift70`; draw the currency separately
+in `bahnschrift20` (124 glyphs, has letters) in the top-right corner, with
+the product name narrowed from 280 to 232px to make room; and fall back to
+`bahnschrift30` when `priceWidthAt70()` says the price would overflow. A
+price shown small is ugly; a price shown truncated is wrong.
+
+Verified on all five live tags -- three `hwType 17`, two `hwType 1` -- plus
+a `129990.00` case confirming the smaller-font fallback. Confirmed visually
+on the glass, which is the only check that would have caught this at all.

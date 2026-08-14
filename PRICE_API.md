@@ -498,7 +498,38 @@ Invoke-RestMethod http://127.0.0.1:8080/price `
   -Body $body
 ```
 
-The current layout supports the detected 296x128 `hwType 17` tag.
+### Which tags the price layout supports
+
+Both 296x128 2.9" Solum M2 variants, which differ only in display controller
+and are interchangeable here:
+
+| `hwType` | constant (`tag_types.h`) | controller |
+|---|---|---|
+| `1` (`0x01`) | `SOLUM_29_SSD1619` | SSD1619 |
+| `17` (`0x11`) | `SOLUM_29_UC8151` | UC8151 |
+
+Both verified on real hardware 2026-08-14. Anything else is refused, because
+the layout coordinates are fixed at 296x128 -- that includes M3/nRF tags
+(`0x33`, 384x168) and every other panel size. **When buying tags, either of
+the two above is fine; listings rarely state the hwType, so order a small
+batch first and check what reports in.**
+
+Supporting other sizes means reading `width`/`height` from
+`resources/tagtypes/<hw>.json` and placing elements proportionally instead of
+hardcoding them -- a contained change in this endpoint, not new firmware.
+
+### Fonts limit what the price can say
+
+`data/fonts/bahnschrift70.vlw`, the large price font, contains **thirteen
+glyphs**: `-`, `.` and the digits. It cannot draw letters or a space. Text it
+cannot draw still occupies width in the right-aligned datum calculation, so
+appending anything to the price pushes real digits off the left edge -- this
+is what once put `499.00` on a shelf sent `8499.00`.
+
+Therefore the price is drawn alone, the currency is drawn separately in
+`bahnschrift20`, and `priceWidthAt70()` drops the price to `bahnschrift30`
+rather than let a long one be clipped. If you change this layout, keep that
+rule: **a price must never be able to render truncated.**
 
 ## AP restart order
 
